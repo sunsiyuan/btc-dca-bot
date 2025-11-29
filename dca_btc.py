@@ -6,7 +6,9 @@ BTC 定投黄金模型 —— TODAY 版本（无历史回测）
 --------------------------------------------
 数据源：
 - Binance 现货 & 合约 API（免费）
-- CoinGecko（免费）
+- Hyperliquid Perp Info API（免费）
+- Yahoo Finance BTC-USD（免费，用于 K 线回退）
+- CoinGecko（仅 SSR-like 指标）
 
 功能：
 - 计算 Mayer Multiple（200D）
@@ -15,6 +17,7 @@ BTC 定投黄金模型 —— TODAY 版本（无历史回测）
 - 30D 年化波动率
 - Funding rate
 - Open Interest 名义价值
+- 综合评分 + 建议定投倍数
 
 输出：
 - 指标快照
@@ -23,6 +26,9 @@ BTC 定投黄金模型 —— TODAY 版本（无历史回测）
 """
 
 import math
+import os
+from datetime import datetime, timedelta, timezone
+
 import requests
 import pandas as pd
 from dataclasses import dataclass
@@ -30,6 +36,16 @@ from dataclasses import dataclass
 BINANCE_SPOT = "https://api.binance.com"
 BINANCE_FUT = "https://fapi.binance.com"
 CG = "https://api.coingecko.com/api/v3"
+YF_CHART = "https://query1.finance.yahoo.com/v8/finance/chart/BTC-USD"
+HL_INFO = "https://api.hyperliquid.xyz/info"
+
+# 数据源配置（支持多数据源 + 回退）
+DATA_SOURCE = os.getenv("DATA_SOURCE", "binance").lower()  # "binance" 或 "yahoo"
+DERIV_SOURCE = os.getenv("DERIV_SOURCE", "hyperliquid").lower()  # "binance" 或 "hyperliquid"
+SIMULATE_BINANCE_FAIL = os.getenv("SIMULATE_BINANCE_FAIL", "0") == "1"
+
+# Hyperliquid perp 资产上下文缓存（避免重复请求）
+_HL_PERP_CTX = None
 
 SESSION = requests.Session()
 SESSION.headers.update({"User-Agent": "btc-dca-today/1.1"})
@@ -48,17 +64,31 @@ def http_get(url, params=None):
         return None
 
 
+def http_post_json(url, payload=None):
+    try:
+        r = SESSION.post(url, json=payload or {}, timeout=15)
+        r.raise_for_status()
+        return r.json()
+    except Exception as e:
+        print(f"⚠️ API 调用失败: {url} {e}")
+        return None
+
+
 # ---------------------------
 # BTC K线
 # ---------------------------
-def get_klines(interval="1d", limit=500) -> pd.DataFrame:
+def _get_klines_from_binance(interval: str = "1d", limit: int = 500) -> pd.DataFrame:
+    """原始 Binance K 线封装，支持模拟失败，用于本地测试 fallback。"""
+    if SIMULATE_BINANCE_FAIL:
+        raise RuntimeError("SIMULATE_BINANCE_FAIL=1，模拟 Binance 失败")
+
     data = http_get(f"{BINANCE_SPOT}/api/v3/klines", {
         "symbol": "BTCUSDT",
         "interval": interval,
-        "limit": limit
+        "limit": limit,
     })
     if not data:
-        return pd.DataFrame()
+        raise RuntimeError("Binance 返回空数据")
 
     cols = [
         "open_time", "open", "high", "low", "close", "volume",
@@ -68,8 +98,105 @@ def get_klines(interval="1d", limit=500) -> pd.DataFrame:
     df = pd.DataFrame(data, columns=cols)
     df["open_time"] = pd.to_datetime(df["open_time"], unit="ms", utc=True)
     df["close"] = df["close"].astype(float)
+    df["volume"] = df["volume"].astype(float)
     df.set_index("open_time", inplace=True)
     return df
+
+
+def _get_klines_from_yahoo(interval: str = "1d", limit: int = 500) -> pd.DataFrame:
+    """Yahoo Finance 版 BTC-USD K 线，作为二级数据源，用于 GitHub Actions 等环境。"""
+    if interval == "1d":
+        yf_interval = "1d"
+        days = limit + 10
+    elif interval == "1w":
+        yf_interval = "1wk"
+        days = limit * 7 + 30
+    else:
+        raise ValueError(f"暂不支持的 interval: {interval}")
+
+    now = datetime.now(timezone.utc)
+    end_ts = int(now.timestamp())
+    start_ts = int((now - timedelta(days=days)).timestamp())
+
+    params = {
+        "period1": start_ts,
+        "period2": end_ts,
+        "interval": yf_interval,
+    }
+    data = http_get(YF_CHART, params)
+    if not data:
+        raise RuntimeError("Yahoo Finance 返回空数据")
+
+    chart = data.get("chart") or {}
+    result = chart.get("result")
+    if not result:
+        raise RuntimeError("Yahoo Finance 返回结构异常：缺少 result")
+
+    res0 = result[0]
+    ts = res0.get("timestamp") or []
+    ind = (res0.get("indicators") or {}).get("quote") or []
+    if not ts or not ind:
+        raise RuntimeError("Yahoo Finance 返回结构异常：缺少时间或报价")
+
+    quote = ind[0]
+    opens = quote.get("open") or []
+    highs = quote.get("high") or []
+    lows = quote.get("low") or []
+    closes = quote.get("close") or []
+    vols = quote.get("volume") or []
+
+    records = []
+    for t, o, h, l, c, v in zip(ts, opens, highs, lows, closes, vols):
+        if c is None:
+            continue
+        c = float(c)
+        o = float(o) if o is not None else c
+        h = float(h) if h is not None else c
+        l = float(l) if l is not None else c
+        v = float(v) if v is not None else 0.0
+
+        records.append({
+            "open_time": datetime.fromtimestamp(t, tz=timezone.utc),
+            "open": o,
+            "high": h,
+            "low": l,
+            "close": c,
+            "volume": v,
+        })
+
+    df = pd.DataFrame.from_records(records)
+    if df.empty:
+        raise RuntimeError("Yahoo Finance 解析后数据为空")
+
+    df.set_index("open_time", inplace=True)
+    # 与 Binance 保持行为一致：只保留最后 limit 根
+    return df.tail(limit)
+
+
+def get_klines(interval: str = "1d", limit: int = 500) -> pd.DataFrame:
+    """对外统一入口：优先尝试 DATA_SOURCE，再自动回退。"""
+    sources = []
+    primary = (DATA_SOURCE or "binance").lower()
+    if primary == "binance":
+        sources = ["binance", "yahoo"]
+    elif primary == "yahoo":
+        sources = ["yahoo", "binance"]
+    else:
+        sources = [primary, "binance", "yahoo"]
+
+    last_err = None
+    for src_name in sources:
+        try:
+            if src_name == "binance":
+                return _get_klines_from_binance(interval, limit)
+            elif src_name == "yahoo":
+                return _get_klines_from_yahoo(interval, limit)
+        except Exception as e:
+            print(f"⚠️ get_klines 使用 {src_name} 失败: {e}")
+            last_err = e
+
+    print("⚠️ 所有数据源获取 K 线失败")
+    return pd.DataFrame()
 
 
 # ---------------------------
@@ -91,26 +218,23 @@ def get_200w_distance(price=None) -> tuple[float, float]:
     if len(df) < 200:
         return float("nan"), float("nan")
 
-    closes = df["close"]
-    ma200w = closes.tail(200).mean()
+    ma200w = df["close"].tail(200).mean()
     if price is None:
-        price = closes.iloc[-1]
-
+        price = df["close"].iloc[-1]
     dist = (price - ma200w) / ma200w
     return float(ma200w), float(dist)
 
 
 # ---------------------------
-# 30D 年化波动率
+# 波动率
 # ---------------------------
 def get_30d_vol() -> float:
-    df = get_klines("1d", 80)
-    if df.empty:
+    df = get_klines("1d", 60)
+    if len(df) < 30:
         return float("nan")
 
-    prices = df["close"]
-    rets = (prices / prices.shift(1)).dropna().apply(math.log)
-    if len(rets) < 15:
+    rets = df["close"].pct_change().dropna()
+    if len(rets) < 30:
         return float("nan")
 
     daily_std = rets.tail(30).std()
@@ -120,22 +244,111 @@ def get_30d_vol() -> float:
 # ---------------------------
 # Funding / OI
 # ---------------------------
-def get_funding() -> float:
+def _get_hl_perp_ctx() -> dict:
+    """获取 Hyperliquid 上 BTC perp 的资产上下文，带简单缓存。"""
+    global _HL_PERP_CTX
+    if _HL_PERP_CTX is not None:
+        return _HL_PERP_CTX
+
+    data = http_post_json(HL_INFO, {"type": "metaAndAssetCtxs"})
+    if not data or len(data) < 2:
+        raise RuntimeError("Hyperliquid metaAndAssetCtxs 返回异常")
+
+    universe = data[0].get("universe") or []
+    ctxs = data[1]
+    idx = None
+    for i, meta in enumerate(universe):
+        if meta.get("name") == "BTC":
+            idx = i
+            break
+    if idx is None:
+        raise RuntimeError("Hyperliquid 中未找到 BTC 合约")
+    if idx >= len(ctxs):
+        raise RuntimeError("Hyperliquid 资产上下文索引越界")
+
+    _HL_PERP_CTX = ctxs[idx]
+    return _HL_PERP_CTX
+
+
+def _get_funding_from_binance() -> float:
+    if SIMULATE_BINANCE_FAIL:
+        raise RuntimeError("SIMULATE_BINANCE_FAIL=1，模拟 Binance 失败")
+
     data = http_get(f"{BINANCE_FUT}/fapi/v1/fundingRate", {
         "symbol": "BTCUSDT",
-        "limit": 1
+        "limit": 1,
     })
     if not data:
-        return float("nan")
+        raise RuntimeError("Binance funding 返回空数据")
     return float(data[0]["fundingRate"])
 
 
-def get_open_interest() -> float:
+def _get_funding_from_hyperliquid() -> float:
+    ctx = _get_hl_perp_ctx()
+    f = ctx.get("funding")
+    if f is None:
+        raise RuntimeError("Hyperliquid funding 字段缺失")
+    return float(f)
+
+
+def get_funding() -> float:
+    """统一 funding 指标获取，支持多数据源 + 回退。"""
+    primary = (DERIV_SOURCE or "hyperliquid").lower()
+    if primary == "binance":
+        order = ["binance", "hyperliquid"]
+    else:
+        order = ["hyperliquid", "binance"]
+
+    for src_name in order:
+        try:
+            if src_name == "binance":
+                return _get_funding_from_binance()
+            elif src_name == "hyperliquid":
+                return _get_funding_from_hyperliquid()
+        except Exception as e:
+            print(f"⚠️ get_funding 使用 {src_name} 失败: {e}")
+
+    return float("nan")
+
+
+def _get_oi_from_binance() -> float:
+    if SIMULATE_BINANCE_FAIL:
+        raise RuntimeError("SIMULATE_BINANCE_FAIL=1，模拟 Binance 失败")
+
     oi = http_get(f"{BINANCE_FUT}/fapi/v1/openInterest", {"symbol": "BTCUSDT"})
     price = http_get(f"{BINANCE_FUT}/fapi/v1/ticker/price", {"symbol": "BTCUSDT"})
     if not oi or not price:
-        return float("nan")
+        raise RuntimeError("Binance OI / 价格返回空")
     return float(oi["openInterest"]) * float(price["price"])
+
+
+def _get_oi_from_hyperliquid() -> float:
+    ctx = _get_hl_perp_ctx()
+    oi = ctx.get("openInterest")
+    px = ctx.get("markPx")
+    if oi is None or px is None:
+        raise RuntimeError("Hyperliquid openInterest 或 markPx 字段缺失")
+    return float(oi) * float(px)
+
+
+def get_open_interest() -> float:
+    """统一 open interest 指标获取，支持多数据源 + 回退。"""
+    primary = (DERIV_SOURCE or "hyperliquid").lower()
+    if primary == "binance":
+        order = ["binance", "hyperliquid"]
+    else:
+        order = ["hyperliquid", "binance"]
+
+    for src_name in order:
+        try:
+            if src_name == "binance":
+                return _get_oi_from_binance()
+            elif src_name == "hyperliquid":
+                return _get_oi_from_hyperliquid()
+        except Exception as e:
+            print(f"⚠️ get_open_interest 使用 {src_name} 失败: {e}")
+
+    return float("nan")
 
 
 # ---------------------------
@@ -149,26 +362,30 @@ STABLES = [
 
 def get_ssr_like() -> float:
     btc = http_get(f"{CG}/coins/bitcoin", {
-        "localization":"false","tickers":"false","market_data":"true"
+        "localization": "false", "tickers": "false", "market_data": "true"
     })
     if not btc:
         return float("nan")
 
-    btc_mc = btc["market_data"]["market_cap"]["usd"]
+    btc_mcap = btc["market_data"]["market_cap"]["usd"]
 
     ids = ",".join(STABLES)
-    data = http_get(f"{CG}/coins/markets", {
-        "vs_currency": "usd", "ids":ids, "per_page":len(STABLES)
+    st = http_get(f"{CG}/coins/markets", {
+        "vs_currency": "usd",
+        "ids": ids,
+        "order": "market_cap_desc",
+        "per_page": len(STABLES),
+        "page": 1,
+        "sparkline": "false",
     })
-    if not data:
+    if not st:
         return float("nan")
 
-    stable_mc = sum([c.get("market_cap") or 0 for c in data])
-
-    if stable_mc <= 0:
+    stable_mcap = sum(x.get("market_cap", 0.0) for x in st)
+    if stable_mcap == 0:
         return float("nan")
 
-    return float(btc_mc / stable_mc)
+    return float(btc_mcap / stable_mcap)
 
 
 # ---------------------------
@@ -202,7 +419,6 @@ def score_valuation(mayer, dist):
         else: score -= 2
     return score
 
-
 def score_liquidity(ssr):
     if math.isnan(ssr): return 0
     if ssr < 1.5: return 2
@@ -223,7 +439,6 @@ def score_risk(vol, funding):
         elif funding < 0.0002: score += 0  # 轻微波动（微正/微负）→ 不加不减
         else: score -= 2 # 明确偏热 → 扣分
     return score
-
 
 # ---------------------------
 # 决策
