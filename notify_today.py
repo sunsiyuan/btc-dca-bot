@@ -10,9 +10,31 @@ load_dotenv()
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
+FT_SENDKEY = os.getenv("FT_SENDKEY")
 WEBHOOK_URLS = os.getenv("WEBHOOK_URLS", "")  # 可选：多渠道 HTTP webhook
 BASE_AMOUNT = float(os.getenv("BASE_DCA_USDT", "30"))  # 可以用 env 覆盖 base
 
+# ===== 微信推送（Server酱） =====
+def send_wechat_by_ft(content: str):
+    """
+    使用方糖/Server酱推送微信消息。
+    遇到错误自动跳过，不影响主程序。
+    """
+    if not FT_SENDKEY:
+        print("方糖未配置，跳过通知")
+        return
+    try:
+        url = f"https://sctapi.ftqq.com/{FT_SENDKEY}.send"
+        data = {
+            "title": "BTC定投今日推送",
+            "desp": content,
+        }
+        r = requests.post(url, data=data, timeout=10)
+        r.raise_for_status()
+        return True
+    except Exception as e:
+        print(f"[WARN] 微信（Server酱）推送失败: {e}")
+        return False
 
 def send_telegram(text: str):
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
@@ -88,6 +110,7 @@ def main():
     msg = build_message(result)
     print(msg)
     send_telegram(msg)
+    send_wechat_by_ft(msg)
     send_webhooks(msg)
 
 
