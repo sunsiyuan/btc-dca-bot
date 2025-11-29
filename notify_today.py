@@ -52,6 +52,7 @@ def build_message(result: dict) -> str:
     score = result["score"]
     base = result["base"]
     invest = result["invest"]
+    risk_hint = result.get("risk_hint", "风险水平中性，暂无明显极端信号。")
 
     lines = [
         "📊 今日 BTC 定投模型结果",
@@ -63,6 +64,7 @@ def build_message(result: dict) -> str:
         f"🟣 距 200W MA: {snap.dist200w*100:.2f}%",
         f"🟢 SSR-like: {snap.ssr:.3f}",
         f"🟠 30D 年化波动率: {snap.vol30d:.3f}",
+        f"📉 过去 7 天涨跌幅: {snap.trend7d*100:.2f}%",
         f"🔺 Funding Rate: {snap.funding:.5f}",
         f"📦 Open Interest 名义价值: {snap.oi:,.0f}",
         "",
@@ -72,9 +74,12 @@ def build_message(result: dict) -> str:
         f"📌 建议定投倍数: {mult}x",
         f"👉 今日建议投入: {invest:.2f} USDT",
         "",
+        f"⚠️ 风险提示: {risk_hint}",
+        "",
         f"📘 说明: {text}",
     ]
     return "\n".join(lines)
+
 
 
 def main():

@@ -392,6 +392,7 @@ class Snapshot:
     vol30d: float
     funding: float
     oi: float
+    trend7d: float  # 过去 7 天涨跌幅（相对值，例如 0.05=+5%）
 
 
 def score_valuation(mayer, dist):
@@ -431,6 +432,21 @@ def score_risk(vol, funding):
         else: score -= 2  # 明确偏热 → 扣分
     return score
 
+def get_7d_trend() -> float:
+    """
+    计算过去 7 天的涨跌幅：
+    trend = (最新收盘价 / 7 天前收盘价) - 1
+    """
+    df = get_klines("1d", 10)
+    if len(df) < 8:
+        return float("nan")
+
+    price_now = df["close"].iloc[-1]
+    price_7d_ago = df["close"].iloc[-8]  # 7 天前的收盘
+    if price_7d_ago <= 0:
+        return float("nan")
+
+    return float(price_now / price_7d_ago - 1.0)
 
 # ---------------------------
 # 决策
@@ -462,6 +478,33 @@ def decide(snapshot: Snapshot):
 
     return m, txt, total
 
+def build_risk_hint(snap: Snapshot) -> str:
+    """
+    根据 funding / OI 给出一句自然语言风险提示。
+    阈值是经验参数，可以日后根据感觉调。
+    """
+    hints = []
+
+    # Funding 过热 / 过冷
+    if not math.isnan(snap.funding):
+        if snap.funding > 0.0008:
+            hints.append("资金费率明显偏正，多头较拥挤，短期回撤风险增加。")
+        elif snap.funding < -0.0005:
+            hints.append("资金费率明显为负，空头较拥挤，存在空头挤压的可能。")
+
+    # OI 绝对值很大（这里用一个比较保守的阈值）
+    if not math.isnan(snap.oi):
+        # snap.oi 是名义价值（USDT），这里粗暴用 20B / 30B 做分段
+        if snap.oi > 30_000_000_000:
+            hints.append("永续合约 OI 名义价值处于极高水平，杠杆堆积，波动可能被明显放大。")
+        elif snap.oi > 20_000_000_000:
+            hints.append("永续合约 OI 处于偏高区间，需关注杠杆集中带来的波动放大风险。")
+
+    if not hints:
+        return "风险水平中性，暂未出现资金费率或杠杆明显极端的信号。"
+
+    return "；".join(hints)
+
 
 # ---------------------------
 # 主流程封装：给通知 / 交易用的接口
@@ -476,6 +519,7 @@ def run_today(base: float = 30.0):
         score: 综合得分
         base: 基础定投金额
         invest: 建议实际投入金额（base * mult）
+        risk_hint: 基于 funding / OI 的一句风险提示
     """
     # 现货收盘价（来自 K 线）+ 衍生品 mark price（更加稳定）
     price, ma200d, mayer = get_mayer()
@@ -486,10 +530,25 @@ def run_today(base: float = 30.0):
     vol = get_30d_vol()
     funding = get_funding()
     oi = get_open_interest()
+    trend7d = get_7d_trend()
 
-    snap = Snapshot(price, mark_price, ma200d, mayer, ma200w, dist, ssr, vol, funding, oi)
+    snap = Snapshot(
+        price=price,
+        mark_price=mark_price,
+        ma200d=ma200d,
+        mayer=mayer,
+        ma200w=ma200w,
+        dist200w=dist,
+        ssr=ssr,
+        vol30d=vol,
+        funding=funding,
+        oi=oi,
+        trend7d=trend7d,
+    )
     mult, text, score = decide(snap)
     invest = base * mult
+    risk_hint = build_risk_hint(snap)
+
     return {
         "snapshot": snap,
         "mult": mult,
@@ -497,7 +556,9 @@ def run_today(base: float = 30.0):
         "score": score,
         "base": base,
         "invest": invest,
+        "risk_hint": risk_hint,
     }
+
 
 
 # ---------------------------
@@ -517,6 +578,7 @@ def main():
     print("\n===== 今日 BTC 定投决策 =====")
     print(f"价格: {snap.price:,.2f}")
     print(f"Mark Price（衍生品）: {snap.mark_price:,.2f}")
+    print(f"过去 7 天涨跌幅: {snap.trend7d*100:.2f}%")   
     print(f"Mayer Multiple: {snap.mayer:.3f}")
     print(f"距200W: {snap.dist200w*100:.2f}%")
     print(f"SSR-like: {snap.ssr:.3f}")
