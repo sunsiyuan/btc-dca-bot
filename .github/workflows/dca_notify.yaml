@@ -28,6 +28,7 @@ jobs:
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          FT_SENDKEY: ${{ secrets.FT_SENDKEY }}
           WEBHOOK_URLS: ${{ secrets.WEBHOOK_URLS }}   # 可选
           BASE_DCA_USDT: "30"                         # 可以在这里改基础定投金额
         run: |
