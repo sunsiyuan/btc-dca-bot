@@ -69,12 +69,12 @@ def send_webhooks(text: str):
 
 def build_message(result: dict) -> str:
     snap: Snapshot = result["snapshot"]
-    mult = result["mult"]
-    text = result["text"]
-    score = result["score"]
-    base = result["base"]
-    invest = result["invest"]
-    risk_hint = result.get("risk_hint", "风险水平中性，暂无明显极端信号。")
+    sources = result.get("sources", {})
+    # 动态显示本次实际使用的数据源
+    ds_lines = []
+    for k, v in sources.items():
+        if v:  # 只显示非空数据源
+            ds_lines.append(f"• {k}: {v}")
 
     lines = [
         "📊 今日 BTC 定投模型结果",
@@ -90,22 +90,32 @@ def build_message(result: dict) -> str:
         f"🔺 Funding Rate: {snap.funding:.5f}",
         f"📦 Open Interest 名义价值: {snap.oi:,.0f}",
         "",
-        f"🧮 综合得分: {score}",
+        f"🧮 综合得分: {result['score']}",
         "",
-        f"💰 基础定投金额: {base:.2f} USDT",
-        f"📌 建议定投倍数: {mult}x",
-        f"👉 今日建议投入: {invest:.2f} USDT",
+        f"💰 基础定投金额: {result['base']:.2f} USDT",
+        f"📌 建议定投倍数: {result['mult']}x",
+        f"📘 定投倍数说明: {result['text']}",
+        f"🛡️ 风险预算因子: {result['risk_factor']:.2f}",
+        f"📉 风险因子解释: {result.get('risk_factor_text', '')}",
+        f"👉 今日建议投入: {result['invest']:.2f} USDT",
+        # "",
+        # f"⚠️ 风险提示: {result.get('risk_hint', "风险水平中性，暂无明显极端信号。")}",
+        # "",
+        # "📡 数据源说明（逻辑）:",
+        # "• K线 / 价格：优先 Binance 现货 BTCUSDT，失败时回退 OKX。",
+        # "• Mark Price / Funding / OI：Hyperliquid 优先，失败时回退 Binance 永续。",
+        # "• SSR-like：CoinGecko — BTC 市值 ÷ 稳定币篮子市值。",
         "",
-        f"⚠️ 风险提示: {risk_hint}",
-        "",
-        f"📘 说明: {text}",
-        "",
-        "📡 数据源说明：",
-        "• K线 / 价格：优先使用 Binance 现货 BTCUSDT，失败时自动回退 OKX 现货 BTC-USDT。",
-        "• Mark Price / Funding / OI：优先使用 Hyperliquid BTC 永续合约，失败时回退 Binance U 本位永续 BTCUSDT。",
-        "• SSR-like：CoinGecko 上 BTC 市值 ÷ 稳定币篮子市值（USDT / USDC / DAI / FDUSD / FRAX / USDe / USDD / PYUSD）。",
+        "📡 本次实际使用的数据源：",
     ]
+
+    if ds_lines:
+        lines.extend(ds_lines)
+    else:
+        lines.append("（无数据源信息，可能是模型内部异常）")
+
     return "\n".join(lines)
+
 
 
 

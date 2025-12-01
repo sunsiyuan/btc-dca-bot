@@ -2,27 +2,103 @@
 # -*- coding: utf-8 -*-
 
 """
-BTC 定投黄金模型 —— TODAY 版本（无历史回测）
---------------------------------------------
-数据源：
-- Binance 现货 & 合约 API（免费）
-- Hyperliquid Perp Info API（免费）
-- OKX 现货 BTC-USDT（备用 K 线数据源，Binance 失败时回退）
-- CoinGecko（仅 SSR-like 指标）
+BTC 定投策略框架（当前版本）
+=============================
 
-功能：
-- 计算 Mayer Multiple（200D）
-- 相对 200W MA
-- SSR-like（BTC市值 / 稳定币篮子）
-- 30D 年化波动率
-- Funding rate
-- Open Interest 名义价值
-- 综合评分 + 建议定投倍数
+本系统是一个“估值因子 × 风险因子”的动态定投模型，用于 BTC 的长期累积型投资。
+核心目标是用数据量化“买多少”，用机制避免极端风险，并在结构良好的低估周期中显著提高买入力度。
 
-输出：
+整体架构由三部分组成：
+
+----------------------------------------------------------------------
+1. 估值因子（Valuation Factors）→ 决定“价格贵还是便宜”
+----------------------------------------------------------------------
+估值因子不直接预测未来价格，而是判断当前是否属于历史上偏低/偏高的区域。
+使用的输入包括但不限于：
+- Mayer Multiple（价格 / 200W MA）
+- 距离 200W MA 百分比（价格定位）
+- SSR-like（BTC 市值 ÷ 稳定币市值篮子）
+- 7 日趋势（短期价格方向）
+- 其他可扩展估值指标
+
+这些分项会被加总为一个“估值得分（total score）”，
+再映射成一个基础 multiplier（估值倍数）。
+估值越低，倍数越大；越高估，倍数越小或为 0。
+
+估值倍数体现的是：
+“在这个价格区间，长线配置应当有多积极。”
+
+---------------------------------------------------------------------- 
+2. 风险因子（Risk Budget Factor）→ 决定“今天能不能这么 aggressive 买”
+----------------------------------------------------------------------
+风险因子通过市场结构状态来调节买入强度，避免在高杠杆、高波动的危险时段过度建仓。
+使用的输入包括但不限于：
+- 30 日年化波动率（Volatility）
+- Funding Rate（资金费率）
+- 永续合约 OI（杠杆规模）
+- OI 的 7 日趋势（杠杆是否在累积）
+- 其他可扩展市场结构指标
+
+风险因子会输出一个 0.0–1.0 的连续权重：
+- 趋于 1.0 表示“风险并不高，可以安心买”
+- 趋于 0.4–0.6 表示“结构不稳，需减少买入”
+- 极端风险区间会进一步降低倍数
+
+风险因子的作用是：
+“在风险高的区间，即使便宜也要谨慎；风险低时才允许强力加仓。”
+
+---------------------------------------------------------------------- 
+3. 最终投入计算 = Base × Multiplier × RiskFactor
+----------------------------------------------------------------------
+最终每日实际买入金额由三者共同决定：
+- Base：基础定投金额（固定设定）
+- Multiplier：估值得分映射出的倍数（1.5x / 2.5x / 6x / 10x ...）
+- RiskFactor：市场结构健康度（0.4–1.0）
+
+合成行为特征：
+- 高估 + 高风险：0× 或极低买入
+- 高估 + 低风险：仍然少量买入，避免踏空
+- 低估 + 高风险：保持谨慎，只在结构稳定后再加大力度
+- 低估 + 低风险：强力加仓，提升每轮熊市底部获取筹码的效率
+
+这是一个“价值驱动 + 风险控制”的组合机制，
+避免了纯估值 DCA 的盲目，也避免了情绪化追高。
+
+---------------------------------------------------------------------- 
+4. 数据源与 fallback 机制
+----------------------------------------------------------------------
+为了在 GitHub Actions 中长期稳定运行，所有关键数据都有多层 fallback：
+- 价格与 K 线：Binance → OKX
+- Funding / OI / Mark Price：Hyperliquid → Binance
+- OI 历史：Binance → Hyperliquid 本地缓存（按日去重）
+- SSR-like：CoinGecko 稳定币篮子
+
+若实际执行中某数据源失败，则自动回退，保证每日运行不中断。
+
+---------------------------------------------------------------------- 
+5. 核心设计理念
+----------------------------------------------------------------------
+本策略从不预测价格，而是：
+- 在“不贵但又安全”的区间多买
+- 在“波动+杠杆都在累积”的时期少买
+- 在“极端高估或高风险”的区间停止买
+- 在“极端低估且风险释放”的区间大力建仓
+
+整个框架旨在提升：
+✔ 有效买入质量  
+✔ 资金使用效率  
+✔ 长期收益/回撤比  
+✔ 极端行情下的防御能力  
+
+同时保持代码结构可扩展，可随时添加新的估值因子或风险因子。
+
+----------------------------------------------------------------------
+6. 结果输出
+----------------------------------------------------------------------
 - 指标快照
 - 定投倍数
 - 总结性建议
+----------------------------------------------------------------------
 """
 
 import math
@@ -31,13 +107,16 @@ from datetime import datetime, timedelta, timezone
 
 import requests
 import pandas as pd
+import numpy as np
 from dataclasses import dataclass
+import json
 
 BINANCE_SPOT = "https://api.binance.com"
 BINANCE_FUT = "https://fapi.binance.com"
 OKX_SPOT = "https://www.okx.com"
 CG = "https://api.coingecko.com/api/v3"
 HL_INFO = "https://api.hyperliquid.xyz/info"
+OI_CACHE_FILE = "hl_oi_history.json"
 
 # 数据源配置（支持多数据源 + 回退）
 DATA_SOURCE = os.getenv("DATA_SOURCE", "binance").lower()  # "binance" 或 "okx"
@@ -48,8 +127,17 @@ SIMULATE_BINANCE_FAIL = os.getenv("SIMULATE_BINANCE_FAIL", "0") == "1"
 _HL_PERP_CTX = None
 
 SESSION = requests.Session()
-SESSION.headers.update({"User-Agent": "btc-dca-today/1.2"})
+SESSION.headers.update({"User-Agent": "btc-dca-model/1.0"})
 
+# 记录本次运行实际使用的数据源
+DATA_SOURCES = {
+    "klines": "",
+    "mark_price": "",
+    "funding": "",
+    "oi": "",
+    "oi_history": "",
+    "ssr": "",
+}
 
 # ---------------------------
 # 工具
@@ -151,8 +239,10 @@ def get_klines(interval: str = "1d", limit: int = 500) -> pd.DataFrame:
     for src_name in sources:
         try:
             if src_name == "binance":
+                DATA_SOURCES["kline"] = "binance"
                 return _get_klines_from_binance(interval, limit)
             elif src_name == "okx":
+                DATA_SOURCES["kline"] = "okx"
                 return _get_klines_from_okx(interval, limit)
         except Exception as e:
             last_err = e
@@ -266,8 +356,10 @@ def get_funding() -> float:
     for src_name in order:
         try:
             if src_name == "binance":
+                DATA_SOURCES["funding"] = "binance"
                 return _get_funding_from_binance()
             elif src_name == "hyperliquid":
+                DATA_SOURCES["funding"] = "hyperliquid"
                 return _get_funding_from_hyperliquid()
         except Exception as e:
             print(f"⚠️ get_funding 使用 {src_name} 失败: {e}")
@@ -306,8 +398,10 @@ def get_open_interest() -> float:
     for src_name in order:
         try:
             if src_name == "binance":
+                DATA_SOURCES["oi"] = "binance"
                 return _get_oi_from_binance()
             elif src_name == "hyperliquid":
+                DATA_SOURCES["oi"] = "hyperliquid"
                 return _get_oi_from_hyperliquid()
         except Exception as e:
             print(f"⚠️ get_open_interest 使用 {src_name} 失败: {e}")
@@ -316,28 +410,192 @@ def get_open_interest() -> float:
 
 
 def get_mark_price() -> float:
-    """统一获取 BTC 的 mark price（优先 Binance 永续，备用 Hyperliquid）。"""
-    # 优先使用 Binance U 本位永续的 premiumIndex 作为 mark price
+    """统一获取 BTC 的 mark price（优先 Hyperliquid Perp，备用 Binance 永续）。"""
+    # 优先：使用 Hyperliquid BTC perp 的 markPx
+    try:
+        ctx = _get_hl_perp_ctx()
+        px = ctx.get("markPx") if ctx else None
+        if px is not None:
+            DATA_SOURCES["mark_price"] = "hyperliquid"
+            return float(px)
+    except Exception as e:
+        print(f"⚠️ get_mark_price 使用 hyperliquid 失败: {e}")
+
+    # 回退：使用 Binance U 本位永续的 premiumIndex 作为 mark price
     try:
         if SIMULATE_BINANCE_FAIL:
             raise RuntimeError("SIMULATE_BINANCE_FAIL=1，模拟 Binance 失败")
 
         data = http_get(f"{BINANCE_FUT}/fapi/v1/premiumIndex", {"symbol": "BTCUSDT"})
         if data and isinstance(data, dict) and "markPrice" in data:
+            DATA_SOURCES["mark_price"] = "binance"
             return float(data["markPrice"])
     except Exception as e:
         print(f"⚠️ get_mark_price 使用 binance 失败: {e}")
 
-    # 回退：使用 Hyperliquid BTC perp 的 markPx
+    return float("nan")
+
+# ---------------------------
+# OI History for Risk Factor
+# ---------------------------
+def _load_oi_cache() -> list:
+    """从本地 JSON 加载 HL OI 历史缓存。"""
+    if not os.path.exists(OI_CACHE_FILE):
+        return []
+    try:
+        with open(OI_CACHE_FILE, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception as e:
+        print(f"⚠️ 读取 {OI_CACHE_FILE} 失败: {e}")
+        return []
+
+
+def _save_oi_cache(data: list):
+    """保存 HL OI 历史缓存到 JSON。"""
+    try:
+        with open(OI_CACHE_FILE, "w", encoding="utf-8") as f:
+            json.dump(data, f)
+    except Exception as e:
+        print(f"⚠️ 写入 {OI_CACHE_FILE} 失败: {e}")
+
+
+def record_hl_oi_for_cache():
+    """
+    每次运行脚本时，尝试从 Hyperliquid 读取当前 OI（名义价值），
+    并写入本地缓存 JSON，作为 Binance OI 历史失败时的备份。
+    """
     try:
         ctx = _get_hl_perp_ctx()
-        px = ctx.get("markPx") if ctx else None
-        if px is not None:
-            return float(px)
+        oi = ctx.get("openInterest")
+        px = ctx.get("markPx")
+        if oi is None or px is None:
+            raise RuntimeError("Hyperliquid openInterest 或 markPx 字段缺失")
+        notional = float(oi) * float(px)
     except Exception as e:
-        print(f"⚠️ get_mark_price 使用 hyperliquid 失败: {e}")
+        print(f"⚠️ 记录 HL OI 缓存失败: {e}")
+        return
 
-    return float("nan")
+    data = _load_oi_cache()
+    now_ts = datetime.now(timezone.utc).timestamp()
+    data.append({"ts": now_ts, "oi": notional})
+
+    # 只保留最近 120 条（约 4 个月），避免文件无限增长
+    if len(data) > 120:
+        data = data[-120:]
+
+    _save_oi_cache(data)
+
+
+def _load_hl_oi_history_from_cache(days: int = 7) -> list:
+    data = _load_oi_cache()
+    if not data:
+        return []
+
+    now = datetime.now(timezone.utc)
+    cutoff = now - timedelta(days=days)
+
+    # 按日期去重：每天只保留最新的一条
+    daily = {}
+    for item in data:
+        ts = item.get("ts", 0)
+        dt = datetime.fromtimestamp(ts, timezone.utc)
+        if dt < cutoff:
+            continue
+        day_key = dt.date()
+        # 覆盖写入：保留每天最新的一条
+        daily[day_key] = item
+
+    # 按日期排序
+    sorted_items = [daily[k] for k in sorted(daily.keys())]
+
+    return [float(x["oi"]) for x in sorted_items]
+
+
+
+def get_oi_history_from_binance(days: int = 7) -> list:
+    """
+    从 Binance U 本位永续获取 OI 日线历史（名义价值）。
+    优先用于计算 OI 趋势，失败时再使用 HL 缓存。
+    """
+    if SIMULATE_BINANCE_FAIL:
+        raise RuntimeError("SIMULATE_BINANCE_FAIL=1，模拟 Binance 失败")
+
+    # Binance futures OI 历史接口：openInterestHist
+    data = http_get(f"{BINANCE_FUT}/futures/data/openInterestHist", {
+        "symbol": "BTCUSDT",
+        "period": "1d",
+        "limit": max(days + 1, 10),
+    })
+    if not data:
+        raise RuntimeError("Binance OI history 返回空数据")
+
+    # 按时间从旧到新排序（接口通常已按时间升序，但这里防御性处理一次）
+    try:
+        data_sorted = sorted(data, key=lambda x: int(x.get("timestamp", 0)))
+    except Exception:
+        data_sorted = data
+
+    # sumOpenInterest 是以 BTC 计价的持仓数量；需要乘以价格才是名义价值。
+    # 这里为了简化 & 避免额外价格请求，我们直接用 sumOpenInterest 做“相对变化”的衡量即可。
+    # 对于趋势而言，使用 BTC 数量和使用名义价值的方向是一致的。
+    oi_list = [float(x["sumOpenInterest"]) for x in data_sorted]
+
+    # 只取最后 N 天
+    if len(oi_list) >= days:
+        oi_list = oi_list[-days:]
+
+    return oi_list
+
+
+def compute_oi_trend(days: int = 7) -> float:
+    """
+    统一的 OI 趋势计算：
+    1. 优先使用 Binance 的 OI 历史（sumOpenInterest）计算 7 日斜率；
+    2. 如果失败 / 数据不足，则回退到本地缓存的 HL OI；
+    3. 如果仍然不足，则返回 0（视为中性）。
+    """
+    oi_list = []
+    # 1) 优先 Binance
+    try:
+        oi_list = get_oi_history_from_binance(days)
+        if len(oi_list) >= 3:
+            DATA_SOURCES["oi_history"] = "binance"
+    except Exception as e:
+        print(f"⚠️ compute_oi_trend 使用 Binance OI history 失败: {e}")
+        oi_list = []
+
+    # 2) 回退：HL 本地缓存
+    if len(oi_list) < 3:
+        oi_list = _load_hl_oi_history_from_cache(days)
+        if len(oi_list) >= 3:
+            DATA_SOURCES["oi_history"] = "hyperliquid_cache"
+
+    if len(oi_list) < 3:
+        # 数据太少，无法算趋势 → 当作中性
+        return 0.0
+
+    oi_vals = np.array(oi_list, dtype=float)
+    t = np.arange(len(oi_vals))
+
+    # 最小二乘线性回归 slope
+    slope = np.polyfit(t, oi_vals, 1)[0]
+
+    # 标准化为“相对每日增长率”
+    norm_slope = slope / np.mean(oi_vals)
+
+    return float(norm_slope)
+
+
+def oi_risk_from_trend(tr):
+    """根据 7 日 OI 趋势确定风险预算因子"""
+    if tr < 0.01:
+        return 1.0     # 稳定
+    elif tr < 0.03:
+        return 0.7     # 中等风险
+    elif tr < 0.07:
+        return 0.4     # 杠杆明显上升
+    else:
+        return 0.1     # 杠杆过度堆积（危险）
 
 
 # ---------------------------
@@ -367,6 +625,7 @@ def get_ssr_like() -> float:
         "page": 1,
         "sparkline": "false",
     })
+    DATA_SOURCES["ssr"] = "coingecko" 
     if not st:
         return float("nan")
 
@@ -432,6 +691,7 @@ def score_risk(vol, funding):
         else: score -= 2  # 明确偏热 → 扣分
     return score
 
+
 def get_7d_trend() -> float:
     """
     计算过去 7 天的涨跌幅：
@@ -442,39 +702,126 @@ def get_7d_trend() -> float:
         return float("nan")
 
     price_now = df["close"].iloc[-1]
+    # price_1d_ago = df["close"].iloc[-2]
     price_7d_ago = df["close"].iloc[-8]  # 7 天前的收盘
     if price_7d_ago <= 0:
         return float("nan")
 
     return float(price_now / price_7d_ago - 1.0)
 
+
 # ---------------------------
 # 决策
 # ---------------------------
+def compute_risk_budget(snapshot: Snapshot, oi_tr: float) -> float:
+    """基于波动率 + OI趋势 + Funding 动态压缩/放大定投"""
+
+    # ---- 1) 波动率风险 ----
+    v = snapshot.vol30d
+    if v < 0.4:      vol_risk = 1.0
+    elif v < 0.7:    vol_risk = 0.7
+    elif v < 1.0:    vol_risk = 0.4
+    else:            vol_risk = 0.1
+
+    # ---- 2) Hyperliquid OI 7日趋势 ----
+    oi_risk = oi_risk_from_trend(oi_tr)
+
+    # ---- 3) Funding 风险 ----
+    f = snapshot.funding
+    if f < 0:
+        funding_risk = 1.0
+    elif f < 0.01:
+        funding_risk = 0.8
+    elif f < 0.02:
+        funding_risk = 0.5
+    else:
+        funding_risk = 0.2
+
+    # ---- 最终风险预算因子 ----
+    return min(vol_risk, oi_risk, funding_risk)
+
+def explain_risk_factor(snapshot: Snapshot, risk_factor: float, oi_tr: float) -> str:
+    reasons = []
+
+    # ===== 1) 波动率解释 =====
+    vol = snapshot.vol30d
+    if vol < 0.4:
+        reasons.append("波动率较低（市场稳定）")
+    elif vol < 0.7:
+        reasons.append("波动率中等（风险可控）")
+    elif vol < 1.0:
+        reasons.append("波动率偏高（行情震荡加剧）")
+    else:
+        reasons.append("波动率极高（剧烈行情风险）")
+
+    # ===== 2) OI 趋势解释（结合价格方向）=====
+    # snapshot.trend7d 是你已有的 7 日涨跌幅
+    price_tr = snapshot.trend7d
+
+    if oi_tr < -0.01:
+        # OI 下跌 → 去杠杆
+        if price_tr < 0:
+            reasons.append("OI 下行 + 价格下跌（去杠杆释放风险）")
+        else:
+            reasons.append("OI 下行 + 价格上涨（空头平仓，谨慎追涨）")
+    elif oi_tr < 0.01:
+        reasons.append("OI 稳定（杠杆未显著变化）")
+    elif oi_tr < 0.03:
+        reasons.append("OI 小幅上升（杠杆略有累积）")
+    elif oi_tr < 0.07:
+        reasons.append("OI 明显上升（杠杆进入堆积期）")
+    else:
+        reasons.append("OI 急速上升（高杠杆堆积风险）")
+
+    # ===== 3) Funding 解释 =====
+    f = snapshot.funding
+    if f < 0:
+        reasons.append("Funding 为负（多头压力小）")
+    elif f < 0.01:
+        reasons.append("Funding 中性（市场均衡）")
+    elif f < 0.02:
+        reasons.append("Funding 偏正（多头略显拥挤）")
+    else:
+        reasons.append("Funding 高企（多头过度拥挤）")
+
+    # ===== 拼接 =====
+    text = "；".join(reasons)
+    return f"风险预算因子={risk_factor:.2f}，主要依据：{text}。"
+
+
 def decide(snapshot: Snapshot):
     val = score_valuation(snapshot.mayer, snapshot.dist200w)
     liq = score_liquidity(snapshot.ssr)
     risk = score_risk(snapshot.vol30d, snapshot.funding)
     total = val + liq + risk
 
-    if total >= 7:
-        m = 5
-        txt = "估值极低+风险极低抄大底模式（5x）"
+    if total >= 9:
+        m = 10
+        txt = "极端低估 + 极低风险，大底建仓（10x）"
+
+    elif total >= 7:
+        m = 6
+        txt = "显著低估，强力加仓（6x）"
+
     elif total >= 4:
-        m = 3
-        txt = "明显低估，积极建仓（3x）。"
+        m = 4
+        txt = "明显低估，积极建仓（4x）"
+
     elif total >= 2:
-        m = 1.5
-        txt = "估值略低，机会较好（1.5x）。"
+        m = 2.5
+        txt = "轻度低估，主动建仓（2.5x）"
+
     elif total >= 0:
-        m = 1
-        txt = "中性区间，正常定投（1x）。"
-    elif total >= -1:
-        m = 0.5
-        txt = "偏贵或风险偏高，减半定投（0.5x）。"
+        m = 1.5
+        txt = "中性区间，正常定投（1.5x）"
+
+    elif total >= -2:
+        m = 0.75
+        txt = "偏高估，减少投入（0.75x）"
+
     else:
         m = 0
-        txt = "高估+高风险，暂停定投（0x）。"
+        txt = "高估 + 高风险，暂停定投（0x）"
 
     return m, txt, total
 
@@ -515,6 +862,7 @@ def run_today(base: float = 30.0):
     返回：
         snapshot: Snapshot 实例（全量指标）
         mult: 建议定投倍数
+        risk_factor: 根据风险预算模型计算的市场情绪风险因子
         text: 文字说明
         score: 综合得分
         base: 基础定投金额
@@ -545,8 +893,16 @@ def run_today(base: float = 30.0):
         oi=oi,
         trend7d=trend7d,
     )
+
+    # 先记录一份当日 HL OI 到本地缓存（如果 HL 可用）
+    record_hl_oi_for_cache()
+    # 计算 OI 7 日趋势（优先 Binance，失败则用 HL 缓存）
+    oi_tr = compute_oi_trend(days=7)
+
     mult, text, score = decide(snap)
-    invest = base * mult
+    risk_factor = compute_risk_budget(snap, oi_tr)
+    risk_factor_text = explain_risk_factor(snap, risk_factor, oi_tr)
+    invest = base * mult * risk_factor
     risk_hint = build_risk_hint(snap)
 
     return {
@@ -557,6 +913,9 @@ def run_today(base: float = 30.0):
         "base": base,
         "invest": invest,
         "risk_hint": risk_hint,
+        "risk_factor": risk_factor,
+        "risk_factor_text": risk_factor_text,
+        "sources": DATA_SOURCES.copy(),
     }
 
 
@@ -570,6 +929,7 @@ def main():
 
     snap = result["snapshot"]
     mult = result["mult"]
+    rf = result["risk_factor"]
     text = result["text"]
     score = result["score"]
     invest = result["invest"]
@@ -589,13 +949,18 @@ def main():
 
     print(f"\n基础定投金额：{base:.2f} USDT")
     print(f"建议定投倍数：{mult}x")
+    print(f"风险预算因子: {rf:.2f}")
     print(f"今日实际应投入：{invest:.2f} USDT")
-    print(f"解释：{text}")
+    print(f"定投倍数解释：{text}")
+    print(f"风险因子解释: {result.get('risk_factor_text', '')}")
 
-    print("\n--- 数据源说明 ---")
-    print("K线 / 价格：优先 Binance 现货 BTCUSDT，失败时回退 OKX 现货 BTC-USDT。")
-    print("Mark Price / Funding / OI：优先 Hyperliquid BTC 永续，失败时回退 Binance U 本位永续 BTCUSDT。")
-    print("SSR-like：CoinGecko 上 BTC 市值 ÷ 稳定币篮子（USDT / USDC / DAI / FDUSD / FRAX / USDe / USDD / PYUSD）。")
+    # print("\n--- 数据源说明 ---")
+    # print("K线 / 价格：优先 Binance 现货 BTCUSDT，失败时回退 OKX 现货 BTC-USDT。")
+    # print("Mark Price / Funding / OI（杠杆、情绪）：优先 Hyperliquid BTC 永续，失败时回退 Binance U 本位永续 BTCUSDT。")
+    # print("SSR-like：CoinGecko 上 BTC 市值 ÷ 稳定币篮子（USDT / USDC / DAI / FDUSD / FRAX / USDe / USDD / PYUSD）。")
+    print("\n--- 本次运行实际数据源 ---")
+    for k, v in DATA_SOURCES.items():
+        if v: print(f"{k}: {v}")
 
 
 
