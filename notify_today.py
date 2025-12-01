@@ -99,6 +99,11 @@ def build_message(result: dict) -> str:
         f"⚠️ 风险提示: {risk_hint}",
         "",
         f"📘 说明: {text}",
+        "",
+        "📡 数据源说明：",
+        "• K线 / 价格：优先使用 Binance 现货 BTCUSDT，失败时自动回退 OKX 现货 BTC-USDT。",
+        "• Mark Price / Funding / OI：优先使用 Hyperliquid BTC 永续合约，失败时回退 Binance U 本位永续 BTCUSDT。",
+        "• SSR-like：CoinGecko 上 BTC 市值 ÷ 稳定币篮子市值（USDT / USDC / DAI / FDUSD / FRAX / USDe / USDD / PYUSD）。",
     ]
     return "\n".join(lines)
 

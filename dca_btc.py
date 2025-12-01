@@ -592,6 +592,12 @@ def main():
     print(f"今日实际应投入：{invest:.2f} USDT")
     print(f"解释：{text}")
 
+    print("\n--- 数据源说明 ---")
+    print("K线 / 价格：优先 Binance 现货 BTCUSDT，失败时回退 OKX 现货 BTC-USDT。")
+    print("Mark Price / Funding / OI：优先 Hyperliquid BTC 永续，失败时回退 Binance U 本位永续 BTCUSDT。")
+    print("SSR-like：CoinGecko 上 BTC 市值 ÷ 稳定币篮子（USDT / USDC / DAI / FDUSD / FRAX / USDe / USDD / PYUSD）。")
+
+
 
 if __name__ == "__main__":
     main()
