@@ -116,7 +116,8 @@ BINANCE_FUT = "https://fapi.binance.com"
 OKX_SPOT = "https://www.okx.com"
 CG = "https://api.coingecko.com/api/v3"
 HL_INFO = "https://api.hyperliquid.xyz/info"
-OI_CACHE_FILE = "hl_oi_history.json"
+# 将缓存文件放在脚本同目录，避免因工作目录不同导致路径漂移
+OI_CACHE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "hl_oi_history.json")
 
 # 数据源配置（支持多数据源 + 回退）
 DATA_SOURCE = os.getenv("DATA_SOURCE", "binance").lower()  # "binance" 或 "okx"
@@ -497,18 +498,30 @@ def _load_hl_oi_history_from_cache(days: int = 7) -> list:
     # 按日期去重：每天只保留最新的一条
     daily = {}
     for item in data:
-        ts = item.get("ts", 0)
+        try:
+            ts = float(item.get("ts", 0))
+        except Exception:
+            print(f"⚠️ 跳过无效缓存记录（ts 无法解析）：{item}")
+            continue
         dt = datetime.fromtimestamp(ts, timezone.utc)
         if dt < cutoff:
             continue
         day_key = dt.date()
-        # 覆盖写入：保留每天最新的一条
-        daily[day_key] = item
+        try:
+            oi_val = float(item.get("oi"))
+        except Exception:
+            print(f"⚠️ 跳过无效缓存记录（oi 无法解析）：{item}")
+            continue
+
+        # 覆盖写入：保留每天最新的一条（时间戳更大的覆盖旧的）
+        prev = daily.get(day_key)
+        if not prev or ts >= float(prev.get("ts", 0)):
+            daily[day_key] = {"ts": ts, "oi": oi_val}
 
     # 按日期排序
     sorted_items = [daily[k] for k in sorted(daily.keys())]
 
-    return [float(x["oi"]) for x in sorted_items]
+    return [x["oi"] for x in sorted_items]
 
 
 
@@ -571,7 +584,11 @@ def compute_oi_trend(days: int = 7) -> float:
             DATA_SOURCES["oi_history"] = "hyperliquid_cache"
 
     if len(oi_list) < 3:
-        # 数据太少，无法算趋势 → 当作中性
+        # 数据太少，无法算趋势 → 当作中性，但仍记录数据来源方便排查
+        if oi_list and not DATA_SOURCES.get("oi_history"):
+            DATA_SOURCES["oi_history"] = "hyperliquid_cache"
+        if not DATA_SOURCES.get("oi_history"):
+            DATA_SOURCES["oi_history"] = "unavailable"
         return 0.0
 
     oi_vals = np.array(oi_list, dtype=float)

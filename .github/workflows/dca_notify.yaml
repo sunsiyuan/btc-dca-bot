@@ -6,6 +6,9 @@ on:
     - cron: "0 0 * * *"
   workflow_dispatch: {}  # 支持手动点执行
 
+permissions:
+  contents: write
+
 jobs:
   notify:
     runs-on: ubuntu-latest
@@ -31,5 +34,18 @@ jobs:
           FT_SENDKEY: ${{ secrets.FT_SENDKEY }}
           WEBHOOK_URLS: ${{ secrets.WEBHOOK_URLS }}   # 可选
           BASE_DCA_USDT: "30"                         # 可以在这里改基础定投金额
+        working-directory: ${{ github.workspace }}     # 确保读取/写入 hl_oi_history.json 的相对路径是仓库根目录
         run: |
           python notify_today.py
+
+      - name: Commit updated OI cache
+        if: github.event_name != 'pull_request'
+        working-directory: ${{ github.workspace }}
+        run: |
+          if [[ -n "$(git status --porcelain=1 -- hl_oi_history.json)" ]]; then
+            git config user.name "github-actions[bot]"
+            git config user.email "github-actions[bot]@users.noreply.github.com"
+            git add hl_oi_history.json
+            git commit -m "Update Hyperliquid OI cache"
+            git push
+          fi
