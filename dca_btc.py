@@ -603,16 +603,54 @@ def compute_oi_trend(days: int = 7) -> float:
     return float(norm_slope)
 
 
-def oi_risk_from_trend(tr):
-    """根据 7 日 OI 趋势确定风险预算因子"""
-    if tr < 0.01:
-        return 1.0     # 稳定
+def oi_risk_from_trend(tr: float) -> float:
+    """根据 7 日 OI 趋势确定风险预算因子（tr 是归一化后的斜率，比如 7 日涨幅）"""
+    if tr <= 0:
+        return 1.0     # 杠杆在撤，风险降低
+    elif tr < 0.01:
+        return 0.9     # 略微上升
     elif tr < 0.03:
         return 0.7     # 中等风险
     elif tr < 0.07:
         return 0.4     # 杠杆明显上升
     else:
         return 0.1     # 杠杆过度堆积（危险）
+
+
+def funding_risk_from_funding(f: float) -> float:
+    """
+    根据 funding rate 估算风险：
+    - 先按 |f| 的大小判断“拥挤程度”
+    - 再按方向（正/负）略微调整：正 funding 对多头更危险
+    f 是每 8 小时或每天的 funding rate，比如 0.0001 = 0.01%
+    """
+
+    if math.isnan(f):
+        return 1.0
+
+    af = abs(f)
+
+    # 1) 拥挤程度：用绝对值切桶
+    if af < 0.00005:
+        base = 1.0   # 非常接近 0，市场相对均衡
+    elif af < 0.0002:
+        base = 0.8   # 有些拥挤，但还在可接受范围
+    elif af < 0.0008:
+        base = 0.5   # 比较极端的情绪了
+    else:
+        base = 0.2   # 极端拥挤，容易发生挤兑/挤爆仓行情
+
+    # 2) 按方向微调
+    if f > 0:
+        # 多头付钱给空头：做多更危险 → 稍微再降一点风险得分
+        funding_risk = max(0.1, base - 0.1)
+    elif f < 0:
+        # 空头付钱给多头：对现货/多头来说风险略低一点
+        funding_risk = min(1.0, base + 0.1)
+    else:
+        funding_risk = base
+
+    return funding_risk
 
 
 # ---------------------------
@@ -745,17 +783,16 @@ def compute_risk_budget(snapshot: Snapshot, oi_tr: float) -> float:
 
     # ---- 3) Funding 风险 ----
     f = snapshot.funding
-    if f < 0:
-        funding_risk = 1.0
-    elif f < 0.01:
-        funding_risk = 0.8
-    elif f < 0.02:
-        funding_risk = 0.5
-    else:
-        funding_risk = 0.2
+    funding_risk = funding_risk_from_funding(f)
 
     # ---- 最终风险预算因子 ----
-    return min(vol_risk, oi_risk, funding_risk)
+    # 采用“最弱项 + 平滑靠近均值”的方式，避免某一指标轻微异常就把风险压得过低
+    factors = [vol_risk, oi_risk, funding_risk]
+    weakest = min(factors)
+    avg = sum(factors) / len(factors)
+    alpha = 0.25  # 建议范围 0.25 ~ 0.35：alpha 越大越接近均值，越小越接近最弱项
+
+    return weakest + alpha * (avg - weakest)
 
 def explain_risk_factor(snapshot: Snapshot, risk_factor: float, oi_tr: float) -> str:
     reasons = []
@@ -792,14 +829,23 @@ def explain_risk_factor(snapshot: Snapshot, risk_factor: float, oi_tr: float) ->
 
     # ===== 3) Funding 解释 =====
     f = snapshot.funding
-    if f < 0:
-        reasons.append("Funding 为负（多头压力小）")
-    elif f < 0.01:
-        reasons.append("Funding 中性（市场均衡）")
-    elif f < 0.02:
-        reasons.append("Funding 偏正（多头略显拥挤）")
+    af = abs(f)
+    if math.isnan(f):
+        reasons.append("Funding 数据缺失，按中性处理")
+    elif af < 0.00005:
+        reasons.append("Funding 接近 0（市场均衡）")
+    elif af < 0.0002:
+        reasons.append("Funding 轻微（杠杆有一定拥挤）")
+    elif af < 0.0008:
+        reasons.append("Funding 偏高（情绪开始极端）")
     else:
-        reasons.append("Funding 高企（多头过度拥挤）")
+        reasons.append("Funding 极端（高杠杆拥挤风险）")
+
+    if not math.isnan(f):
+        if f > 0:
+            reasons.append("Funding 为正，多头付费 → 做多风险略高")
+        elif f < 0:
+            reasons.append("Funding 为负，空头付费 → 做多风险略低")
 
     # ===== 拼接 =====
     text = "；".join(reasons)
