@@ -343,7 +343,22 @@ def _get_funding_from_hyperliquid() -> float:
     f = ctx.get("funding")
     if f is None:
         raise RuntimeError("Hyperliquid funding 字段缺失")
-    return float(f)
+    return _normalize_hl_funding(float(f))
+
+
+def _normalize_hl_funding(f_val: float) -> float:
+    """将 Hyperliquid 的“每秒资金费率”对齐为 8 小时费率的量级。
+
+    其他所有使用 funding 的逻辑（风险打分 / 通知输出等）都假设是 8h 费率。
+    为避免出现 -0.00000 这样的近零展示或风险权重失真，这里统一处理。
+    """
+    # Hyperliquid 返回的 funding 为“每秒资金费率”，数量级远小于 Binance 的 8 小时费率。
+    # 为了与 Binance 输出保持一致，做一个温和的单位对齐：
+    # - 如果原值非常接近 0（<1e-5），按“每秒 * 8 小时”的尺度放大；
+    # - 若未来官方直接返回 8h 费率或数值本身已正常，则保持原样避免过度放大。
+    if abs(f_val) < 1e-5:
+        f_val *= 8 * 60 * 60
+    return f_val
 
 
 def get_funding() -> float:
@@ -704,7 +719,7 @@ class Snapshot:
     dist200w: float
     ssr: float
     vol30d: float
-    funding: float
+    funding: float  # 统一用 8 小时费率的量级（Hyperliquid 会在获取时归一化）
     oi: float
     trend7d: float  # 过去 7 天涨跌幅（相对值，例如 0.05=+5%）
 
