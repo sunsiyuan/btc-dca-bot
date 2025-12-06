@@ -906,7 +906,12 @@ def compute_risk_brake(snapshot: Snapshot, oi_tr: float, max_brake: float = 0.6)
     base_brake = -max_brake * (1.0 - safety)
 
     price_tr = snapshot.trend7d
-    if not math.isnan(price_tr) and price_tr <= 0:
+    if math.isnan(price_tr):
+        return base_brake * 0.7
+
+    if price_tr <= -0.05:
+        return base_brake * 0.3
+    if price_tr <= 0:
         return base_brake * 0.5
 
     return base_brake
@@ -925,7 +930,11 @@ def explain_risk_brake(snapshot: Snapshot, risk_brake: float, oi_tr: float) -> s
         f"安全分综合为 {safety:.2f}（波动 {s_vol:.2f} / OI 趋势 {s_oi:.2f} / funding {s_funding:.2f}）。"
     )
 
-    if price_tr <= 0:
+    if math.isnan(price_tr):
+        reasons.append("价格 7 日趋势缺失，刹车力度略微削弱以避免过度保守。")
+    elif price_tr <= -0.05:
+        reasons.append("过去 7 日显著下跌，刹车力度大幅折扣以优先抓取超跌机会。")
+    elif price_tr <= 0:
         reasons.append("价格 7 日趋势不强，刹车力度折半以留给下跌机会空间。")
 
     if risk_brake == 0:
