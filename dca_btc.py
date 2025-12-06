@@ -995,33 +995,41 @@ def decide(snapshot: Snapshot):
     liq = score_liquidity(snapshot.ssr)
     total = val + liq
 
-    if total >= 9:
-        m = 10
-        txt = "极端低估 + 极低风险，大底建仓（10x）"
+    if total >= 5.0:
+        m = 10.0
+        txt = "极端低估，历史级机会（10x）"
 
-    elif total >= 7:
-        m = 6
-        txt = "显著低估，强力加仓（6x）"
+    elif total >= 4.0:
+        m = 7.0
+        txt = "深度低估，强力加仓（7x）"
 
-    elif total >= 4:
-        m = 4
-        txt = "明显低估，积极建仓（4x）"
+    elif total >= 3.0:
+        m = 5.0
+        txt = "明显低估，积极建仓（5x）"
 
-    elif total >= 2:
-        m = 2.5
-        txt = "轻度低估，主动建仓（2.5x）"
+    elif total >= 2.5:
+        m = 3.5
+        txt = "偏明显低估，主动加仓（3.5x）"
 
-    elif total >= 0:
+    elif total >= 2.0:
+        m = 2.7
+        txt = "轻度低估偏多，稳健加仓（2.7x）"
+
+    elif total >= 1.5:
+        m = 2.0
+        txt = "轻度低估，略微放大定投（2.0x）"
+
+    elif total >= 0.0:
         m = 1.5
         txt = "中性区间，正常定投（1.5x）"
 
-    elif total >= -2:
+    elif total >= -1.5:
         m = 0.75
         txt = "偏高估，减少投入（0.75x）"
 
     else:
-        m = 0
-        txt = "高估 + 高风险，暂停定投（0x）"
+        m = 0.2
+        txt = "高估 + 泡沫倾向，仅象征性投入（0.2x）"
 
     return m, txt, total
 
