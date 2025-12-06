@@ -3,7 +3,7 @@
 
 import os
 import requests
-from dca_btc import run_today, Snapshot  # Snapshot 主要是类型提示，可选
+from dca_btc import append_run_log, run_today, Snapshot  # Snapshot 主要是类型提示，可选
 from dotenv import load_dotenv
 load_dotenv()
 
@@ -127,6 +127,7 @@ def main():
     result = run_today(base=BASE_AMOUNT)
     msg = build_message(result)
     print(msg)
+    append_run_log(result)
     send_telegram(msg)
     send_wechat_by_ft(msg)
     send_webhooks(msg)

@@ -111,6 +111,7 @@ BTC Adaptive DCA Strategy — Model Overview (v3)
 import math
 import os
 from datetime import datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
 
 import requests
 import pandas as pd
@@ -1031,7 +1032,7 @@ def decide(snapshot: Snapshot):
         m = 0.2
         txt = "高估 + 泡沫倾向，仅象征性投入（0.2x）"
 
-    return m, txt, total
+    return m, txt, total, val, liq
 
 def build_risk_hint(snap: Snapshot) -> str:
     """
@@ -1109,7 +1110,7 @@ def run_today(base: float = 30.0):
     kline_df = get_klines("1d", 200)
     vol_ctx = compute_volatility_context(kline_df, base_window=30)
 
-    mult, text, score = decide(snap)
+    mult, text, score, val_score, liq_score = decide(snap)
     risk_brake = compute_risk_brake(snap, oi_tr)
     volatility_edge, z, daily_ret = compute_volatility_edge(
         snap, vol_ctx["ma"], vol_ctx["atr"], vol_ctx["prev_close"],
@@ -1120,6 +1121,11 @@ def run_today(base: float = 30.0):
     invest = base * final_mult
     risk_hint = build_risk_hint(snap)
 
+    safety_vol = safety_from_vol(snap.vol30d)
+    safety_oi = safety_from_oi_trend(oi_tr)
+    safety_funding = safety_from_funding(snap.funding)
+    safety_score = compute_safety_score(snap, oi_tr)
+
     risk_brake_text = explain_risk_brake(snap, risk_brake, oi_tr)
     vol_edge_text = explain_volatility_edge(volatility_edge, z, daily_ret)
 
@@ -1128,6 +1134,9 @@ def run_today(base: float = 30.0):
         "mult": mult,
         "text": text,
         "score": score,
+        "valuation_score": val_score,
+        "liquidity_score": liq_score,
+        "oi_trend": oi_tr,
         "base": base,
         "invest": invest,
         "risk_hint": risk_hint,
@@ -1136,13 +1145,161 @@ def run_today(base: float = 30.0):
         "volatility_edge": volatility_edge,
         "volatility_edge_text": vol_edge_text,
         "final_mult": final_mult,
+        "raw_final_mult": raw_final_mult,
         "z_score": z,
         "daily_ret": daily_ret,
         "atr14": vol_ctx["atr14"],
         "atr60": vol_ctx["atr60"],
         "adaptive_window": vol_ctx["window"],
+        "ma_adaptive": vol_ctx["ma"],
+        "atr_adaptive": vol_ctx["atr"],
+        "safety_vol": safety_vol,
+        "safety_oi": safety_oi,
+        "safety_funding": safety_funding,
+        "safety_score": safety_score,
         "sources": DATA_SOURCES.copy(),
     }
+
+
+
+# ---------------------------
+# Run logging
+# ---------------------------
+def append_run_log(result: dict, log_path: str = "logs/dca_runs.csv"):
+    """Append or update the daily run log for offline analysis.
+
+    Logging failures are swallowed to avoid breaking the main flow.
+    """
+    try:
+        snap: Snapshot = result.get("snapshot")
+        if snap is None:
+            raise ValueError("missing snapshot in result")
+
+        sources = result.get("sources", {})
+
+        now_utc = datetime.now(timezone.utc).replace(microsecond=0)
+        ts_utc = now_utc.isoformat().replace("+00:00", "Z")
+        ts_local = now_utc.astimezone(ZoneInfo("Asia/Tokyo")).isoformat()
+        decision_date = now_utc.date().isoformat()
+
+        columns = [
+            "ts_utc",
+            "ts_local",
+            "decision_date",
+            "data_source_klines",
+            "data_source_oi",
+            "data_source_funding",
+            "price_spot",
+            "price_mark",
+            "mayer",
+            "dist_200w",
+            "ssr_like",
+            "vol30d",
+            "funding",
+            "oi_notional",
+            "oi_trend_7d",
+            "price_trend_7d",
+            "atr14",
+            "atr60",
+            "adaptive_window",
+            "ma_adaptive",
+            "atr_adaptive",
+            "z_score",
+            "valuation_score",
+            "liquidity_score",
+            "total_score",
+            "mult_raw",
+            "safety_vol",
+            "safety_oi",
+            "safety_funding",
+            "safety_score",
+            "risk_brake",
+            "volatility_edge",
+            "final_mult",
+            "base_invest",
+            "invest_amount",
+            "edge_triggered",
+            "brake_strength_level",
+            "price_30d_forward",
+            "price_300d_forward",
+            "pnl_30d",
+            "pnl_300d",
+        ]
+
+        risk_brake = result.get("risk_brake", float("nan"))
+        volatility_edge = result.get("volatility_edge", 0.0)
+
+        def _brake_level(brake: float) -> str:
+            if math.isnan(brake) or brake >= 0:
+                return "none"
+            if brake <= -0.4:
+                return "heavy"
+            if brake <= -0.2:
+                return "medium"
+            return "light"
+
+        record = {
+            "ts_utc": ts_utc,
+            "ts_local": ts_local,
+            "decision_date": decision_date,
+            "data_source_klines": sources.get("kline", ""),
+            "data_source_oi": sources.get("oi", ""),
+            "data_source_funding": sources.get("funding", ""),
+            "price_spot": snap.price,
+            "price_mark": snap.mark_price,
+            "mayer": snap.mayer,
+            "dist_200w": snap.dist200w,
+            "ssr_like": snap.ssr,
+            "vol30d": snap.vol30d,
+            "funding": snap.funding,
+            "oi_notional": snap.oi,
+            "oi_trend_7d": result.get("oi_trend", float("nan")),
+            "price_trend_7d": snap.trend7d,
+            "atr14": result.get("atr14", float("nan")),
+            "atr60": result.get("atr60", float("nan")),
+            "adaptive_window": result.get("adaptive_window", float("nan")),
+            "ma_adaptive": result.get("ma_adaptive", float("nan")),
+            "atr_adaptive": result.get("atr_adaptive", float("nan")),
+            "z_score": result.get("z_score", float("nan")),
+            "valuation_score": result.get("valuation_score", float("nan")),
+            "liquidity_score": result.get("liquidity_score", float("nan")),
+            "total_score": result.get("score", float("nan")),
+            "mult_raw": result.get("raw_final_mult", float("nan")),
+            "safety_vol": result.get("safety_vol", float("nan")),
+            "safety_oi": result.get("safety_oi", float("nan")),
+            "safety_funding": result.get("safety_funding", float("nan")),
+            "safety_score": result.get("safety_score", float("nan")),
+            "risk_brake": risk_brake,
+            "volatility_edge": volatility_edge,
+            "final_mult": result.get("final_mult", float("nan")),
+            "base_invest": result.get("base", float("nan")),
+            "invest_amount": result.get("invest", float("nan")),
+            "edge_triggered": bool(volatility_edge),
+            "brake_strength_level": _brake_level(risk_brake),
+            "price_30d_forward": "",
+            "price_300d_forward": "",
+            "pnl_30d": "",
+            "pnl_300d": "",
+        }
+
+        os.makedirs(os.path.dirname(log_path) or ".", exist_ok=True)
+
+        df_existing = pd.DataFrame(columns=columns)
+        if os.path.exists(log_path):
+            df_existing = pd.read_csv(log_path)
+            for col in columns:
+                if col not in df_existing.columns:
+                    df_existing[col] = np.nan
+            df_existing = df_existing[df_existing["decision_date"].astype(str) != decision_date]
+            df_existing = df_existing[columns]
+
+        df_new = pd.concat([
+            df_existing,
+            pd.DataFrame([record], columns=columns),
+        ], ignore_index=True)
+        df_new.to_csv(log_path, index=False)
+    except Exception as e:
+        print(f"⚠️ 写入运行日志失败：{e}")
 
 
 
@@ -1192,6 +1349,8 @@ def main():
     print("\n--- 本次运行实际数据源 ---")
     for k, v in DATA_SOURCES.items():
         if v: print(f"{k}: {v}")
+
+    append_run_log(result)
 
 
 
