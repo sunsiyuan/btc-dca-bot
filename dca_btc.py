@@ -132,7 +132,7 @@ SESSION.headers.update({"User-Agent": "btc-dca-model/1.0"})
 
 # 记录本次运行实际使用的数据源
 DATA_SOURCES = {
-    "klines": "",
+    "kline": "",
     "mark_price": "",
     "funding": "",
     "oi": "",
@@ -793,7 +793,7 @@ def compute_volatility_context(df: pd.DataFrame, base_window: int = 30) -> dict:
 
     ma = float(np.mean(closes[-window:]))
     atr = wilder_atr(tr_values, window)
-    prev_close = float(closes[-1])
+    prev_close = float(closes[-2]) if len(closes) >= 2 else float(closes[-1])
 
     return {
         "ma": ma,
