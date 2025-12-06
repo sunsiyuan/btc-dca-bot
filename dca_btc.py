@@ -847,41 +847,93 @@ def get_7d_trend() -> float:
     return float(price_now / price_7d_ago - 1.0)
 
 
+def safety_from_vol(vol30: float) -> float:
+    if math.isnan(vol30):
+        return 0.6
+
+    if vol30 < 0.4:
+        return 1.0
+    if vol30 < 0.7:
+        return 0.7
+    if vol30 < 1.0:
+        return 0.4
+    return 0.1
+
+
+def safety_from_oi_trend(oi_tr: float) -> float:
+    if math.isnan(oi_tr):
+        return 0.6
+
+    if oi_tr < 0.0:
+        return 1.0
+    if oi_tr < 0.03:
+        return 0.8
+    if oi_tr < 0.07:
+        return 0.5
+    return 0.2
+
+
+def safety_from_funding(funding: float) -> float:
+    if math.isnan(funding):
+        return 0.6
+
+    if funding < 0.0:
+        return 1.0
+    if funding < 0.01:
+        return 0.8
+    if funding < 0.03:
+        return 0.5
+    return 0.2
+
+
+def compute_safety_score(snapshot: Snapshot, oi_tr: float, alpha: float = 0.25) -> float:
+    s_vol = safety_from_vol(snapshot.vol30d)
+    s_oi = safety_from_oi_trend(oi_tr)
+    s_funding = safety_from_funding(snapshot.funding)
+
+    factors = [s_vol, s_oi, s_funding]
+    weakest = min(factors)
+    avg = sum(factors) / len(factors)
+    safety = weakest + alpha * (avg - weakest)
+    return max(0.0, min(1.0, safety))
+
+
 # ---------------------------
 # 决策
 # ---------------------------
-def compute_risk_brake(snapshot: Snapshot, oi_tr: float) -> float:
+def compute_risk_brake(snapshot: Snapshot, oi_tr: float, max_brake: float = 0.6) -> float:
+    safety = compute_safety_score(snapshot, oi_tr)
+    base_brake = -max_brake * (1.0 - safety)
+
     price_tr = snapshot.trend7d
-    funding = snapshot.funding
+    if not math.isnan(price_tr) and price_tr <= 0:
+        return base_brake * 0.5
 
-    risk_brake = 0.0
-
-    if oi_tr > 0.05 and price_tr > 0 and funding > 0.0:
-        risk_brake = -0.3
-
-    if oi_tr > 0.10:
-        risk_brake = -0.5
-
-    return risk_brake
+    return base_brake
 
 
 def explain_risk_brake(snapshot: Snapshot, risk_brake: float, oi_tr: float) -> str:
     reasons = []
     price_tr = snapshot.trend7d
-    funding = snapshot.funding
 
-    if risk_brake == 0:
-        reasons.append("杠杆和价格结构未出现明显拥挤，保持中性。")
-    else:
-        if oi_tr > 0.10:
-            reasons.append("OI 7 日趋势大幅上升（杠杆快速累积）。")
-        elif oi_tr > 0.05 and price_tr > 0 and funding > 0.0:
-            reasons.append("OI 上行 + 价格上涨 + 正 funding，存在 FOMO 杠杆堆积。")
-        else:
-            reasons.append("杠杆结构偏热，轻微刹车。")
+    s_vol = safety_from_vol(snapshot.vol30d)
+    s_oi = safety_from_oi_trend(oi_tr)
+    s_funding = safety_from_funding(snapshot.funding)
+    safety = compute_safety_score(snapshot, oi_tr)
+
+    reasons.append(
+        f"安全分综合为 {safety:.2f}（波动 {s_vol:.2f} / OI 趋势 {s_oi:.2f} / funding {s_funding:.2f}）。"
+    )
 
     if price_tr <= 0:
-        reasons.append("价格近期未上行，避免在回撤期误伤机会。")
+        reasons.append("价格 7 日趋势不强，刹车力度折半以留给下跌机会空间。")
+
+    if risk_brake == 0:
+        reasons.append("整体结构较安全，未踩刹车。")
+    elif risk_brake > -0.2:
+        reasons.append("轻微收缩仓位，避免在拥挤结构中加速建仓。")
+    else:
+        reasons.append("杠杆或 funding 偏热，显著下调倍数以防 FOMO 风险。")
 
     return "；".join(reasons)
 
