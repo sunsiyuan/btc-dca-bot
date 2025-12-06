@@ -2,104 +2,111 @@
 # -*- coding: utf-8 -*-
 
 """
-BTC 定投策略框架（当前版本）
-=============================
+BTC Adaptive DCA Strategy — Model Overview (v3)
+------------------------------------------------
 
-本系统是一个“估值因子 × 风险因子”的动态定投模型，用于 BTC 的长期累积型投资。
-核心目标是用数据量化“买多少”，用机制避免极端风险，并在结构良好的低估周期中显著提高买入力度。
+本模型是一个动态定投系统（Dynamic DCA），目标不是预测，而是让买入节奏
+自适应市场波动、估值和杠杆情绪。最终买入金额由三层信号共同决定：
 
-整体架构由三部分组成：
+    invest = base_size × final_mult
 
-----------------------------------------------------------------------
-1. 估值因子（Valuation Factors）→ 决定“价格贵还是便宜”
-----------------------------------------------------------------------
-估值因子不直接预测未来价格，而是判断当前是否属于历史上偏低/偏高的区域。
-使用的输入包括但不限于：
-- Mayer Multiple（价格 / 200W MA）
-- 距离 200W MA 百分比（价格定位）
-- SSR-like（BTC 市值 ÷ 稳定币市值篮子）
-- 7 日趋势（短期价格方向）
-- 其他可扩展估值指标
+其中：
 
-这些分项会被加总为一个“估值得分（total score）”，
-再映射成一个基础 multiplier（估值倍数）。
-估值越低，倍数越大；越高估，倍数越小或为 0。
+    final_mult = clamp( mult + risk_brake + volatility_edge, min_mult, max_mult )
 
-估值倍数体现的是：
-“在这个价格区间，长线配置应当有多积极。”
 
----------------------------------------------------------------------- 
-2. 风险因子（Risk Budget Factor）→ 决定“今天能不能这么 aggressive 买”
-----------------------------------------------------------------------
-风险因子通过市场结构状态来调节买入强度，避免在高杠杆、高波动的危险时段过度建仓。
-使用的输入包括但不限于：
-- 30 日年化波动率（Volatility）
-- Funding Rate（资金费率）
-- 永续合约 OI（杠杆规模）
-- OI 的 7 日趋势（杠杆是否在累积）
-- 其他可扩展市场结构指标
+────────────────────────────────────────────────────
+1）Valuation Layer → `mult`
+────────────────────────────────────────────────────
 
-风险因子会输出一个 0.0–1.0 的连续权重：
-- 趋于 1.0 表示“风险并不高，可以安心买”
-- 趋于 0.4–0.6 表示“结构不稳，需减少买入”
-- 极端风险区间会进一步降低倍数
+决定买多少，基于长期估值信号（慢变量）：
 
-风险因子的作用是：
-“在风险高的区间，即使便宜也要谨慎；风险低时才允许强力加仓。”
+- Mayer Multiple
+- 距离 200W MA
+- SSR（Stablecoin / valuation proxy）
 
----------------------------------------------------------------------- 
-3. 最终投入计算 = Base × Multiplier × RiskFactor
-----------------------------------------------------------------------
-最终每日实际买入金额由三者共同决定：
-- Base：基础定投金额（固定设定）
-- Multiplier：估值得分映射出的倍数（1.5x / 2.5x / 6x / 10x ...）
-- RiskFactor：市场结构健康度（0.4–1.0）
+此层为离散阶梯式 multiplier，不包含任何风险变量，避免重复惩罚风险。
 
-合成行为特征：
-- 高估 + 高风险：0× 或极低买入
-- 高估 + 低风险：仍然少量买入，避免踏空
-- 低估 + 高风险：保持谨慎，只在结构稳定后再加大力度
-- 低估 + 低风险：强力加仓，提升每轮熊市底部获取筹码的效率
 
-这是一个“价值驱动 + 风险控制”的组合机制，
-避免了纯估值 DCA 的盲目，也避免了情绪化追高。
+────────────────────────────────────────────────────
+2）Risk Layer → `risk_brake`
+────────────────────────────────────────────────────
 
----------------------------------------------------------------------- 
-4. 数据源与 fallback 机制
-----------------------------------------------------------------------
-为了在 GitHub Actions 中长期稳定运行，所有关键数据都有多层 fallback：
-- 价格与 K 线：Binance → OKX
-- Funding / OI / Mark Price：Hyperliquid → Binance
-- OI 历史：Binance → Hyperliquid 本地缓存（按日去重）
-- SSR-like：CoinGecko 稳定币篮子
+此层只负责“刹车”，永远不负责加倍买入。
 
-若实际执行中某数据源失败，则自动回退，保证每日运行不中断。
+输入信号：
 
----------------------------------------------------------------------- 
-5. 核心设计理念
-----------------------------------------------------------------------
-本策略从不预测价格，而是：
-- 在“不贵但又安全”的区间多买
-- 在“波动+杠杆都在累积”的时期少买
-- 在“极端高估或高风险”的区间停止买
-- 在“极端低估且风险释放”的区间大力建仓
+- Funding Rate（多空成本与情绪方向）
+- 7日 OI 趋势（杠杆结构变化）
+- 30日波动率（市场不确定性）
 
-整个框架旨在提升：
-✔ 有效买入质量  
-✔ 资金使用效率  
-✔ 长期收益/回撤比  
-✔ 极端行情下的防御能力  
+处理方式：
 
-同时保持代码结构可扩展，可随时添加新的估值因子或风险因子。
+- 每项映射为 `[0,1]` 的 safety score（越大越安全）
+- 使用 “min + α*(avg - min)” 平滑组合（默认 α=0.25）
+- 映射为加法偏移量：
 
-----------------------------------------------------------------------
-6. 结果输出
-----------------------------------------------------------------------
-- 指标快照
-- 定投倍数
-- 总结性建议
-----------------------------------------------------------------------
+      risk_brake = -max_brake * (1 - safety_score)
+
+行为强化：
+- 若 `trend7d <= 0`（下跌/震荡区间），risk_brake 部分减弱，避免阻断便宜区间买入。
+- 若上涨 + 杠杆累积 → risk_brake 全额生效。
+
+
+────────────────────────────────────────────────────
+3）Opportunity Layer → `volatility_edge`
+────────────────────────────────────────────────────
+
+用于识别极端下跌导致的“错定价窗口”，仅在快速超跌当日触发加仓。
+
+机制：
+
+- 自适应 ATR 窗口：
+
+      window = clamp(30 * (ATR60 / ATR14), 10, 45)
+
+- 计算偏离程度：
+
+      z = (price - SMA(window)) / ATR(window)
+
+- 判定：
+
+      z <= -1.0  →  +0.3 bias
+      z <= -1.5  →  +0.6 bias
+
+- 若当日已反弹（daily_ret > 4%），则取消 edge，
+  避免在反抽日追高。
+
+
+────────────────────────────────────────────────────
+调参与未来优化方向
+────────────────────────────────────────────────────
+
+可调核心参数：
+
+- `alpha`：风险平滑（默认 0.25），范围建议 0.2–0.45
+- `max_brake`：最大刹车力度（默认 0.6）
+- `z-score阈值`：(-1.0, -1.5) 可根据触发频率调整
+- `edge大小`：可与 max_brake 联动，形成对称行为结构
+- `trend7d gating`：决定刹车在趋势方向上的力度差异
+
+长期优化方向：
+
+- 使用 regime-based smoothing（波动大 → 较快响应，稳定 → 平缓）
+- 动态 edge scaling（随 risk_brake 或 mult 强弱适配）
+- Deadband / hysteresis 防止 multiplier 高频切换
+
+
+────────────────────────────────────────────────────
+设计哲学（TL;DR）
+────────────────────────────────────────────────────
+
+估值决定仓位；
+风险只负责踩刹车；
+短期波动只在错杀日加仓；
+永远不预测，只自适应市场结构。
 """
+
 
 import math
 import os
@@ -132,7 +139,7 @@ SESSION.headers.update({"User-Agent": "btc-dca-model/1.0"})
 
 # 记录本次运行实际使用的数据源
 DATA_SOURCES = {
-    "klines": "",
+    "kline": "",
     "mark_price": "",
     "funding": "",
     "oi": "",
@@ -186,6 +193,9 @@ def _get_klines_from_binance(interval: str = "1d", limit: int = 500) -> pd.DataF
     ]
     df = pd.DataFrame(data, columns=cols)
     df["open_time"] = pd.to_datetime(df["open_time"], unit="ms", utc=True)
+    df["open"] = df["open"].astype(float)
+    df["high"] = df["high"].astype(float)
+    df["low"] = df["low"].astype(float)
     df["close"] = df["close"].astype(float)
     df["volume"] = df["volume"].astype(float)
     df.set_index("open_time", inplace=True)
@@ -219,6 +229,9 @@ def _get_klines_from_okx(interval: str = "1d", limit: int = 500) -> pd.DataFrame
     # 约定列：0=ts(ms),1=open,2=high,3=low,4=close,5=volume
     df = df.rename(columns={0: "open_time", 1: "open", 2: "high", 3: "low", 4: "close", 5: "volume"})
     df["open_time"] = pd.to_datetime(df["open_time"].astype("int64"), unit="ms", utc=True)
+    df["open"] = df["open"].astype(float)
+    df["high"] = df["high"].astype(float)
+    df["low"] = df["low"].astype(float)
     df["close"] = df["close"].astype(float)
     df["volume"] = df["volume"].astype(float)
     df.set_index("open_time", inplace=True)
@@ -724,6 +737,81 @@ class Snapshot:
     trend7d: float  # 过去 7 天涨跌幅（相对值，例如 0.05=+5%）
 
 
+def true_range(high: float, low: float, prev_close: float) -> float:
+    return max(
+        high - low,
+        abs(high - prev_close),
+        abs(low - prev_close),
+    )
+
+
+def wilder_atr(tr_list: list[float], window: int) -> float:
+    if not tr_list:
+        return float("nan")
+
+    if len(tr_list) < window:
+        return float(sum(tr_list) / len(tr_list))
+
+    atr = sum(tr_list[:window]) / window
+    for tr in tr_list[window:]:
+        atr = (atr * (window - 1) + tr) / window
+    return float(atr)
+
+
+def compute_adaptive_window(atr14: float, atr60: float, base_window: int = 30,
+                            min_window: int = 10, max_window: int = 45) -> int:
+    ratio = atr60 / max(atr14, 1e-9)
+    window_raw = round(base_window * ratio)
+    window = min(max(window_raw, min_window), max_window)
+    return int(window)
+
+
+def compute_volatility_context(df: pd.DataFrame, base_window: int = 30) -> dict:
+    if df is None or df.empty:
+        return {
+            "ma": float("nan"),
+            "atr": float("nan"),
+            "prev_close": float("nan"),
+            "atr14": float("nan"),
+            "atr60": float("nan"),
+            "window": base_window,
+        }
+
+    closes = df["close"].astype(float).to_numpy()
+    highs = df["high"].astype(float).to_numpy()
+    lows = df["low"].astype(float).to_numpy()
+
+    if len(closes) == 0:
+        return {
+            "ma": float("nan"),
+            "atr": float("nan"),
+            "prev_close": float("nan"),
+            "atr14": float("nan"),
+            "atr60": float("nan"),
+            "window": base_window,
+        }
+
+    prev_closes = np.concatenate(([closes[0]], closes[:-1]))
+    tr_values = [true_range(h, l, pc) for h, l, pc in zip(highs, lows, prev_closes)]
+
+    atr14 = wilder_atr(tr_values, 14)
+    atr60 = wilder_atr(tr_values, 60)
+    window = compute_adaptive_window(atr14, atr60, base_window=base_window)
+
+    ma = float(np.mean(closes[-window:]))
+    atr = wilder_atr(tr_values, window)
+    prev_close = float(closes[-2]) if len(closes) >= 2 else float(closes[-1])
+
+    return {
+        "ma": ma,
+        "atr": atr,
+        "prev_close": prev_close,
+        "atr14": atr14,
+        "atr60": atr60,
+        "window": window,
+    }
+
+
 def score_valuation(mayer, dist):
     score = 0
     if not math.isnan(mayer):
@@ -748,20 +836,6 @@ def score_liquidity(ssr):
     return -1
 
 
-def score_risk(vol, funding):
-    score = 0
-    if not math.isnan(vol):
-        if vol < 0.6: score += 1
-        elif vol < 1.0: score += 0
-        else: score -= 2
-
-    if not math.isnan(funding):
-        if funding <= -0.0002: score += 1  # 明确偏空 → 加分
-        elif funding < 0.0002: score += 0  # 轻微波动（微正/微负）→ 不加不减
-        else: score -= 2  # 明确偏热 → 扣分
-    return score
-
-
 def get_7d_trend() -> float:
     """
     计算过去 7 天的涨跌幅：
@@ -780,126 +854,182 @@ def get_7d_trend() -> float:
     return float(price_now / price_7d_ago - 1.0)
 
 
+def safety_from_vol(vol30: float) -> float:
+    if math.isnan(vol30):
+        return 0.6
+
+    if vol30 < 0.4:
+        return 1.0
+    if vol30 < 0.7:
+        return 0.7
+    if vol30 < 1.0:
+        return 0.4
+    return 0.1
+
+
+def safety_from_oi_trend(oi_tr: float) -> float:
+    if math.isnan(oi_tr):
+        return 0.6
+
+    if oi_tr < 0.0:
+        return 1.0
+    if oi_tr < 0.03:
+        return 0.8
+    if oi_tr < 0.07:
+        return 0.5
+    return 0.2
+
+
+def safety_from_funding(funding: float) -> float:
+    if math.isnan(funding):
+        return 0.6
+
+    if funding < 0.0:
+        return 1.0
+    if funding < 0.01:
+        return 0.8
+    if funding < 0.03:
+        return 0.5
+    return 0.2
+
+
+def compute_safety_score(snapshot: Snapshot, oi_tr: float, alpha: float = 0.25) -> float:
+    s_vol = safety_from_vol(snapshot.vol30d)
+    s_oi = safety_from_oi_trend(oi_tr)
+    s_funding = safety_from_funding(snapshot.funding)
+
+    factors = [s_vol, s_oi, s_funding]
+    weakest = min(factors)
+    avg = sum(factors) / len(factors)
+    safety = weakest + alpha * (avg - weakest)
+    return max(0.0, min(1.0, safety))
+
+
 # ---------------------------
 # 决策
 # ---------------------------
-def compute_risk_budget(snapshot: Snapshot, oi_tr: float) -> float:
-    """基于波动率 + OI趋势 + Funding 动态压缩/放大定投"""
+def compute_risk_brake(snapshot: Snapshot, oi_tr: float, max_brake: float = 0.6) -> float:
+    safety = compute_safety_score(snapshot, oi_tr)
+    base_brake = -max_brake * (1.0 - safety)
 
-    # ---- 1) 波动率风险 ----
-    v = snapshot.vol30d
-    if v < 0.4:      vol_risk = 1.0
-    elif v < 0.7:    vol_risk = 0.7
-    elif v < 1.0:    vol_risk = 0.4
-    else:            vol_risk = 0.1
+    price_tr = snapshot.trend7d
+    if math.isnan(price_tr):
+        return base_brake * 0.7
 
-    # ---- 2) Hyperliquid OI 7日趋势 ----
-    oi_risk = oi_risk_from_trend(oi_tr)
+    if price_tr <= -0.05:
+        return base_brake * 0.3
+    if price_tr <= 0:
+        return base_brake * 0.5
 
-    # ---- 3) Funding 风险 ----
-    f = snapshot.funding
-    funding_risk = funding_risk_from_funding(f)
+    return base_brake
 
-    # ---- 最终风险预算因子 ----
-    # 采用“最弱项 + 平滑靠近均值”的方式，避免某一指标轻微异常就把风险压得过低
-    factors = [vol_risk, oi_risk, funding_risk]
-    weakest = min(factors)
-    avg = sum(factors) / len(factors)
-    alpha = 0.25  # 建议范围 0.25 ~ 0.35：alpha 越大越接近均值，越小越接近最弱项
 
-    return weakest + alpha * (avg - weakest)
-
-def explain_risk_factor(snapshot: Snapshot, risk_factor: float, oi_tr: float) -> str:
+def explain_risk_brake(snapshot: Snapshot, risk_brake: float, oi_tr: float) -> str:
     reasons = []
-
-    # ===== 1) 波动率解释 =====
-    vol = snapshot.vol30d
-    if vol < 0.4:
-        reasons.append("波动率较低（市场稳定）")
-    elif vol < 0.7:
-        reasons.append("波动率中等（风险可控）")
-    elif vol < 1.0:
-        reasons.append("波动率偏高（行情震荡加剧）")
-    else:
-        reasons.append("波动率极高（剧烈行情风险）")
-
-    # ===== 2) OI 趋势解释（结合价格方向）=====
-    # snapshot.trend7d 是你已有的 7 日涨跌幅
     price_tr = snapshot.trend7d
 
-    if oi_tr < -0.01:
-        # OI 下跌 → 去杠杆
-        if price_tr < 0:
-            reasons.append("OI 下行 + 价格下跌（去杠杆释放风险）")
-        else:
-            reasons.append("OI 下行 + 价格上涨（空头平仓，谨慎追涨）")
-    elif oi_tr < 0.01:
-        reasons.append("OI 稳定（杠杆未显著变化）")
-    elif oi_tr < 0.03:
-        reasons.append("OI 小幅上升（杠杆略有累积）")
-    elif oi_tr < 0.07:
-        reasons.append("OI 明显上升（杠杆进入堆积期）")
+    s_vol = safety_from_vol(snapshot.vol30d)
+    s_oi = safety_from_oi_trend(oi_tr)
+    s_funding = safety_from_funding(snapshot.funding)
+    safety = compute_safety_score(snapshot, oi_tr)
+
+    reasons.append(
+        f"安全分综合为 {safety:.2f}（波动 {s_vol:.2f} / OI 趋势 {s_oi:.2f} / funding {s_funding:.2f}）。"
+    )
+
+    if math.isnan(price_tr):
+        reasons.append("价格 7 日趋势缺失，刹车力度略微削弱以避免过度保守。")
+    elif price_tr <= -0.05:
+        reasons.append("过去 7 日显著下跌，刹车力度大幅折扣以优先抓取超跌机会。")
+    elif price_tr <= 0:
+        reasons.append("价格 7 日趋势不强，刹车力度折半以留给下跌机会空间。")
+
+    if risk_brake == 0:
+        reasons.append("整体结构较安全，未踩刹车。")
+    elif risk_brake > -0.2:
+        reasons.append("轻微收缩仓位，避免在拥挤结构中加速建仓。")
     else:
-        reasons.append("OI 急速上升（高杠杆堆积风险）")
+        reasons.append("杠杆或 funding 偏热，显著下调倍数以防 FOMO 风险。")
 
-    # ===== 3) Funding 解释 =====
-    f = snapshot.funding
-    af = abs(f)
-    if math.isnan(f):
-        reasons.append("Funding 数据缺失，按中性处理")
-    elif af < 0.00005:
-        reasons.append("Funding 接近 0（市场均衡）")
-    elif af < 0.0002:
-        reasons.append("Funding 轻微（杠杆有一定拥挤）")
-    elif af < 0.0008:
-        reasons.append("Funding 偏高（情绪开始极端）")
-    else:
-        reasons.append("Funding 极端（高杠杆拥挤风险）")
+    return "；".join(reasons)
 
-    if not math.isnan(f):
-        if f > 0:
-            reasons.append("Funding 为正，多头付费 → 做多风险略高")
-        elif f < 0:
-            reasons.append("Funding 为负，空头付费 → 做多风险略低")
 
-    # ===== 拼接 =====
-    text = "；".join(reasons)
-    return f"风险预算因子={risk_factor:.2f}，主要依据：{text}。"
+def compute_volatility_edge(snapshot: Snapshot, ma: float, atr: float, prev_close: float):
+    close = snapshot.price
+    if math.isnan(ma) or math.isnan(atr) or math.isnan(prev_close) or prev_close == 0:
+        return 0.0, float("nan"), float("nan")
+
+    daily_ret = (close - prev_close) / prev_close
+    z = (close - ma) / max(atr, 1e-9)
+
+    edge = 0.0
+    if z <= -1.5:
+        edge = 0.6
+    elif z <= -1.0:
+        edge = 0.3
+
+    if daily_ret > 0.04:
+        edge = 0.0
+
+    return edge, z, daily_ret
+
+
+def explain_volatility_edge(edge: float, z: float, daily_ret: float) -> str:
+    if math.isnan(z) or math.isnan(daily_ret):
+        return "波动数据不足，未启用超跌加成。"
+
+    if daily_ret > 0.04:
+        return "当日已大幅反弹，波动套利层不加成。"
+
+    if edge == 0:
+        return "价格偏离均值不够极端，未触发超跌加仓。"
+
+    if edge >= 0.6:
+        return f"价格显著低于均值（z={z:.2f}），触发强力超跌加仓。"
+
+    return f"价格明显低于均值（z={z:.2f}），触发温和超跌加仓。"
 
 
 def decide(snapshot: Snapshot):
     val = score_valuation(snapshot.mayer, snapshot.dist200w)
     liq = score_liquidity(snapshot.ssr)
-    risk = score_risk(snapshot.vol30d, snapshot.funding)
-    total = val + liq + risk
+    total = val + liq
 
-    if total >= 9:
-        m = 10
-        txt = "极端低估 + 极低风险，大底建仓（10x）"
+    if total >= 5.0:
+        m = 10.0
+        txt = "极端低估，历史级机会（10x）"
 
-    elif total >= 7:
-        m = 6
-        txt = "显著低估，强力加仓（6x）"
+    elif total >= 4.0:
+        m = 7.0
+        txt = "深度低估，强力加仓（7x）"
 
-    elif total >= 4:
-        m = 4
-        txt = "明显低估，积极建仓（4x）"
+    elif total >= 3.0:
+        m = 5.0
+        txt = "明显低估，积极建仓（5x）"
 
-    elif total >= 2:
-        m = 2.5
-        txt = "轻度低估，主动建仓（2.5x）"
+    elif total >= 2.5:
+        m = 3.5
+        txt = "偏明显低估，主动加仓（3.5x）"
 
-    elif total >= 0:
+    elif total >= 2.0:
+        m = 2.7
+        txt = "轻度低估偏多，稳健加仓（2.7x）"
+
+    elif total >= 1.5:
+        m = 2.0
+        txt = "轻度低估，略微放大定投（2.0x）"
+
+    elif total >= 0.0:
         m = 1.5
         txt = "中性区间，正常定投（1.5x）"
 
-    elif total >= -2:
+    elif total >= -1.5:
         m = 0.75
         txt = "偏高估，减少投入（0.75x）"
 
     else:
-        m = 0
-        txt = "高估 + 高风险，暂停定投（0x）"
+        m = 0.2
+        txt = "高估 + 泡沫倾向，仅象征性投入（0.2x）"
 
     return m, txt, total
 
@@ -939,13 +1069,13 @@ def run_today(base: float = 30.0):
     计算当日所有指标 + 打分 + 建议。
     返回：
         snapshot: Snapshot 实例（全量指标）
-        mult: 建议定投倍数
-        risk_factor: 根据风险预算模型计算的市场情绪风险因子
+        mult: 估值倍数（估值 + 流动性）
         text: 文字说明
         score: 综合得分
         base: 基础定投金额
-        invest: 建议实际投入金额（base * mult）
+        invest: 建议实际投入金额（base * final_mult）
         risk_hint: 基于 funding / OI 的一句风险提示
+        final_mult: 综合估值 + 风险刹车 + 波动套利后的最终倍数
     """
     # 现货收盘价（来自 K 线）+ 衍生品 mark price（更加稳定）
     price, ma200d, mayer = get_mayer()
@@ -976,12 +1106,22 @@ def run_today(base: float = 30.0):
     record_hl_oi_for_cache()
     # 计算 OI 7 日趋势（优先 Binance，失败则用 HL 缓存）
     oi_tr = compute_oi_trend(days=7)
+    kline_df = get_klines("1d", 200)
+    vol_ctx = compute_volatility_context(kline_df, base_window=30)
 
     mult, text, score = decide(snap)
-    risk_factor = compute_risk_budget(snap, oi_tr)
-    risk_factor_text = explain_risk_factor(snap, risk_factor, oi_tr)
-    invest = base * mult * risk_factor
+    risk_brake = compute_risk_brake(snap, oi_tr)
+    volatility_edge, z, daily_ret = compute_volatility_edge(
+        snap, vol_ctx["ma"], vol_ctx["atr"], vol_ctx["prev_close"],
+    )
+
+    raw_final_mult = mult + risk_brake + volatility_edge
+    final_mult = min(max(raw_final_mult, 0.0), 10.0)
+    invest = base * final_mult
     risk_hint = build_risk_hint(snap)
+
+    risk_brake_text = explain_risk_brake(snap, risk_brake, oi_tr)
+    vol_edge_text = explain_volatility_edge(volatility_edge, z, daily_ret)
 
     return {
         "snapshot": snap,
@@ -991,8 +1131,16 @@ def run_today(base: float = 30.0):
         "base": base,
         "invest": invest,
         "risk_hint": risk_hint,
-        "risk_factor": risk_factor,
-        "risk_factor_text": risk_factor_text,
+        "risk_brake": risk_brake,
+        "risk_brake_text": risk_brake_text,
+        "volatility_edge": volatility_edge,
+        "volatility_edge_text": vol_edge_text,
+        "final_mult": final_mult,
+        "z_score": z,
+        "daily_ret": daily_ret,
+        "atr14": vol_ctx["atr14"],
+        "atr60": vol_ctx["atr60"],
+        "adaptive_window": vol_ctx["window"],
         "sources": DATA_SOURCES.copy(),
     }
 
@@ -1007,7 +1155,9 @@ def main():
 
     snap = result["snapshot"]
     mult = result["mult"]
-    rf = result["risk_factor"]
+    final_mult = result["final_mult"]
+    risk_brake = result["risk_brake"]
+    volatility_edge = result["volatility_edge"]
     text = result["text"]
     score = result["score"]
     invest = result["invest"]
@@ -1026,11 +1176,14 @@ def main():
     print(f"综合得分: {score}")
 
     print(f"\n基础定投金额：{base:.2f} USDT")
-    print(f"建议定投倍数：{mult}x")
-    print(f"风险预算因子: {rf:.2f}")
+    print(f"估值倍数：{mult}x")
+    print(f"风险刹车：{risk_brake:+.2f}")
+    print(f"波动套利加成：{volatility_edge:+.2f}")
+    print(f"最终建议倍数：{final_mult}x")
     print(f"今日实际应投入：{invest:.2f} USDT")
     print(f"定投倍数解释：{text}")
-    print(f"风险因子解释: {result.get('risk_factor_text', '')}")
+    print(f"风险刹车解释: {result.get('risk_brake_text', '')}")
+    print(f"波动套利解释: {result.get('volatility_edge_text', '')}")
 
     # print("\n--- 数据源说明 ---")
     # print("K线 / 价格：优先 Binance 现货 BTCUSDT，失败时回退 OKX 现货 BTC-USDT。")
