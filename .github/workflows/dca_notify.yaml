@@ -38,6 +38,18 @@ jobs:
         run: |
           python notify_today.py
 
+      - name: Commit daily DCA log
+        if: github.event_name != 'pull_request'
+        working-directory: ${{ github.workspace }}
+        run: |
+          if [[ -n "$(git status --porcelain=1 -- logs/dca_runs.csv)" ]]; then
+            git config user.name "btc-dca-bot"
+            git config user.email "bot@example.com"
+            git add logs/dca_runs.csv
+            git commit -m "chore: update daily DCA log" || true
+            git push
+          fi
+
       - name: Commit updated OI cache
         if: github.event_name != 'pull_request'
         working-directory: ${{ github.workspace }}

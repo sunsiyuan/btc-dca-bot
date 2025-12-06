@@ -111,11 +111,12 @@ BTC Adaptive DCA Strategy — Model Overview (v3)
 import math
 import os
 from datetime import datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
 
 import requests
 import pandas as pd
 import numpy as np
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import json
 
 BINANCE_SPOT = "https://api.binance.com"
@@ -726,15 +727,74 @@ def get_ssr_like() -> float:
 class Snapshot:
     price: float
     mark_price: float
-    ma200d: float
     mayer: float
-    ma200w: float
     dist200w: float
     ssr: float
     vol30d: float
     funding: float  # 统一用 8 小时费率的量级（Hyperliquid 会在获取时归一化）
     oi: float
     trend7d: float  # 过去 7 天涨跌幅（相对值，例如 0.05=+5%）
+    ma200d: float = float("nan")
+    ma200w: float = float("nan")
+
+
+@dataclass
+class StrategyConfig:
+    alpha: float = 0.25           # risk smoothing
+    max_brake: float = 0.6        # max risk_brake magnitude
+    z_edge_level1: float = -1.0   # z threshold for mild edge
+    z_edge_level2: float = -1.5   # z threshold for strong edge
+    edge_size1: float = 0.3       # mild edge add
+    edge_size2: float = 0.6       # strong edge add
+    trend_brake_scale_down: float = 0.5  # multiplier applied to brake when trend7d <= 0
+    mult_breakpoints: list[tuple[float, float]] = field(default_factory=lambda: [
+        (5.0, 10.0),
+        (4.0, 7.0),
+        (3.0, 5.0),
+        (2.5, 3.5),
+        (2.0, 2.7),
+        (1.5, 2.0),
+        (0.0, 1.5),
+        (-1.5, 0.75),
+        (float("-inf"), 0.2),
+    ])
+
+
+@dataclass
+class DecisionContext:
+    oi_trend_7d: float = float("nan")
+    ma_adaptive: float = float("nan")
+    atr_adaptive: float = float("nan")
+    prev_close: float = float("nan")
+    adaptive_window: int = 30
+
+
+@dataclass
+class Decision:
+    mult: float
+    mult_text: str
+    valuation_score: float
+    liquidity_score: float
+    total_score: float
+    risk_brake: float
+    volatility_edge: float
+    final_mult: float
+    raw_final_mult: float
+    invest: float
+    safety_vol: float
+    safety_oi: float
+    safety_funding: float
+    safety_score: float
+    risk_brake_text: str
+    volatility_edge_text: str
+    z_score: float
+    daily_ret: float
+    adaptive_window: int
+    ma_adaptive: float
+    atr_adaptive: float
+
+
+DEFAULT_CONFIG = StrategyConfig()
 
 
 def true_range(high: float, low: float, prev_close: float) -> float:
@@ -893,7 +953,7 @@ def safety_from_funding(funding: float) -> float:
     return 0.2
 
 
-def compute_safety_score(snapshot: Snapshot, oi_tr: float, alpha: float = 0.25) -> float:
+def compute_safety_score(snapshot: Snapshot, oi_tr: float, cfg: StrategyConfig = DEFAULT_CONFIG) -> float:
     s_vol = safety_from_vol(snapshot.vol30d)
     s_oi = safety_from_oi_trend(oi_tr)
     s_funding = safety_from_funding(snapshot.funding)
@@ -901,25 +961,25 @@ def compute_safety_score(snapshot: Snapshot, oi_tr: float, alpha: float = 0.25) 
     factors = [s_vol, s_oi, s_funding]
     weakest = min(factors)
     avg = sum(factors) / len(factors)
-    safety = weakest + alpha * (avg - weakest)
+    safety = weakest + cfg.alpha * (avg - weakest)
     return max(0.0, min(1.0, safety))
 
 
 # ---------------------------
 # 决策
 # ---------------------------
-def compute_risk_brake(snapshot: Snapshot, oi_tr: float, max_brake: float = 0.6) -> float:
-    safety = compute_safety_score(snapshot, oi_tr)
-    base_brake = -max_brake * (1.0 - safety)
+def compute_risk_brake(snapshot: Snapshot, oi_tr: float, cfg: StrategyConfig = DEFAULT_CONFIG) -> float:
+    safety = compute_safety_score(snapshot, oi_tr, cfg)
+    base_brake = -cfg.max_brake * (1.0 - safety)
 
     price_tr = snapshot.trend7d
     if math.isnan(price_tr):
         return base_brake * 0.7
 
     if price_tr <= -0.05:
-        return base_brake * 0.3
+        return base_brake * (cfg.trend_brake_scale_down * 0.6)
     if price_tr <= 0:
-        return base_brake * 0.5
+        return base_brake * cfg.trend_brake_scale_down
 
     return base_brake
 
@@ -954,8 +1014,11 @@ def explain_risk_brake(snapshot: Snapshot, risk_brake: float, oi_tr: float) -> s
     return "；".join(reasons)
 
 
-def compute_volatility_edge(snapshot: Snapshot, ma: float, atr: float, prev_close: float):
+def compute_volatility_edge(snapshot: Snapshot, ctx: DecisionContext, cfg: StrategyConfig = DEFAULT_CONFIG):
     close = snapshot.price
+    ma = ctx.ma_adaptive
+    atr = ctx.atr_adaptive
+    prev_close = ctx.prev_close
     if math.isnan(ma) or math.isnan(atr) or math.isnan(prev_close) or prev_close == 0:
         return 0.0, float("nan"), float("nan")
 
@@ -963,10 +1026,10 @@ def compute_volatility_edge(snapshot: Snapshot, ma: float, atr: float, prev_clos
     z = (close - ma) / max(atr, 1e-9)
 
     edge = 0.0
-    if z <= -1.5:
-        edge = 0.6
-    elif z <= -1.0:
-        edge = 0.3
+    if z <= cfg.z_edge_level2:
+        edge = cfg.edge_size2
+    elif z <= cfg.z_edge_level1:
+        edge = cfg.edge_size1
 
     if daily_ret > 0.04:
         edge = 0.0
@@ -990,48 +1053,79 @@ def explain_volatility_edge(edge: float, z: float, daily_ret: float) -> str:
     return f"价格明显低于均值（z={z:.2f}），触发温和超跌加仓。"
 
 
-def decide(snapshot: Snapshot):
+def map_total_to_mult(total: float, cfg: StrategyConfig = DEFAULT_CONFIG) -> tuple[float, str]:
+    for threshold, mult in cfg.mult_breakpoints:
+        if total >= threshold:
+            if mult >= 10:
+                txt = "极端低估，历史级机会（10x）"
+            elif mult >= 7:
+                txt = "深度低估，强力加仓（7x）"
+            elif mult >= 5:
+                txt = "明显低估，积极建仓（5x）"
+            elif mult >= 3.5:
+                txt = "偏明显低估，主动加仓（3.5x）"
+            elif mult >= 2.7:
+                txt = "轻度低估偏多，稳健加仓（2.7x）"
+            elif mult >= 2.0:
+                txt = "轻度低估，略微放大定投（2.0x）"
+            elif mult >= 1.0:
+                txt = "估值中性，按部就班定投（1.5x）"
+            elif mult >= 0.7:
+                txt = "偏高估，减少投入（0.75x）"
+            else:
+                txt = "高估 + 泡沫倾向，仅象征性投入（0.2x）"
+            return mult, txt
+    return cfg.mult_breakpoints[-1][1], "高估 + 泡沫倾向，仅象征性投入（0.2x）"
+
+
+def decide(snapshot: Snapshot, ctx: DecisionContext | None = None, cfg: StrategyConfig = DEFAULT_CONFIG,
+           base_invest: float = 30.0) -> Decision:
+    ctx = ctx or DecisionContext()
+
     val = score_valuation(snapshot.mayer, snapshot.dist200w)
     liq = score_liquidity(snapshot.ssr)
     total = val + liq
 
-    if total >= 5.0:
-        m = 10.0
-        txt = "极端低估，历史级机会（10x）"
+    mult, txt = map_total_to_mult(total, cfg)
 
-    elif total >= 4.0:
-        m = 7.0
-        txt = "深度低估，强力加仓（7x）"
+    risk_brake = compute_risk_brake(snapshot, ctx.oi_trend_7d, cfg)
+    volatility_edge, z, daily_ret = compute_volatility_edge(snapshot, ctx, cfg)
 
-    elif total >= 3.0:
-        m = 5.0
-        txt = "明显低估，积极建仓（5x）"
+    raw_final_mult = mult + risk_brake + volatility_edge
+    final_mult = min(max(raw_final_mult, 0.0), 10.0)
+    invest = base_invest * final_mult
 
-    elif total >= 2.5:
-        m = 3.5
-        txt = "偏明显低估，主动加仓（3.5x）"
+    safety_vol = safety_from_vol(snapshot.vol30d)
+    safety_oi = safety_from_oi_trend(ctx.oi_trend_7d)
+    safety_funding = safety_from_funding(snapshot.funding)
+    safety_score = compute_safety_score(snapshot, ctx.oi_trend_7d, cfg)
 
-    elif total >= 2.0:
-        m = 2.7
-        txt = "轻度低估偏多，稳健加仓（2.7x）"
+    risk_brake_text = explain_risk_brake(snapshot, risk_brake, ctx.oi_trend_7d)
+    vol_edge_text = explain_volatility_edge(volatility_edge, z, daily_ret)
 
-    elif total >= 1.5:
-        m = 2.0
-        txt = "轻度低估，略微放大定投（2.0x）"
-
-    elif total >= 0.0:
-        m = 1.5
-        txt = "中性区间，正常定投（1.5x）"
-
-    elif total >= -1.5:
-        m = 0.75
-        txt = "偏高估，减少投入（0.75x）"
-
-    else:
-        m = 0.2
-        txt = "高估 + 泡沫倾向，仅象征性投入（0.2x）"
-
-    return m, txt, total
+    return Decision(
+        mult=mult,
+        mult_text=txt,
+        valuation_score=val,
+        liquidity_score=liq,
+        total_score=total,
+        risk_brake=risk_brake,
+        volatility_edge=volatility_edge,
+        final_mult=final_mult,
+        raw_final_mult=raw_final_mult,
+        invest=invest,
+        safety_vol=safety_vol,
+        safety_oi=safety_oi,
+        safety_funding=safety_funding,
+        safety_score=safety_score,
+        risk_brake_text=risk_brake_text,
+        volatility_edge_text=vol_edge_text,
+        z_score=z,
+        daily_ret=daily_ret,
+        adaptive_window=ctx.adaptive_window,
+        ma_adaptive=ctx.ma_adaptive,
+        atr_adaptive=ctx.atr_adaptive,
+    )
 
 def build_risk_hint(snap: Snapshot) -> str:
     """
@@ -1091,15 +1185,15 @@ def run_today(base: float = 30.0):
     snap = Snapshot(
         price=price,
         mark_price=mark_price,
-        ma200d=ma200d,
         mayer=mayer,
-        ma200w=ma200w,
         dist200w=dist,
         ssr=ssr,
         vol30d=vol,
         funding=funding,
         oi=oi,
         trend7d=trend7d,
+        ma200d=ma200d,
+        ma200w=ma200w,
     )
 
     # 先记录一份当日 HL OI 到本地缓存（如果 HL 可用）
@@ -1109,40 +1203,195 @@ def run_today(base: float = 30.0):
     kline_df = get_klines("1d", 200)
     vol_ctx = compute_volatility_context(kline_df, base_window=30)
 
-    mult, text, score = decide(snap)
-    risk_brake = compute_risk_brake(snap, oi_tr)
-    volatility_edge, z, daily_ret = compute_volatility_edge(
-        snap, vol_ctx["ma"], vol_ctx["atr"], vol_ctx["prev_close"],
+    ctx = DecisionContext(
+        oi_trend_7d=oi_tr,
+        ma_adaptive=vol_ctx["ma"],
+        atr_adaptive=vol_ctx["atr"],
+        prev_close=vol_ctx["prev_close"],
+        adaptive_window=vol_ctx["window"],
     )
 
-    raw_final_mult = mult + risk_brake + volatility_edge
-    final_mult = min(max(raw_final_mult, 0.0), 10.0)
-    invest = base * final_mult
+    decision = decide(snap, ctx=ctx, cfg=DEFAULT_CONFIG, base_invest=base)
     risk_hint = build_risk_hint(snap)
-
-    risk_brake_text = explain_risk_brake(snap, risk_brake, oi_tr)
-    vol_edge_text = explain_volatility_edge(volatility_edge, z, daily_ret)
 
     return {
         "snapshot": snap,
-        "mult": mult,
-        "text": text,
-        "score": score,
+        "mult": decision.mult,
+        "text": decision.mult_text,
+        "score": decision.total_score,
+        "valuation_score": decision.valuation_score,
+        "liquidity_score": decision.liquidity_score,
+        "oi_trend": oi_tr,
         "base": base,
-        "invest": invest,
+        "invest": decision.invest,
         "risk_hint": risk_hint,
-        "risk_brake": risk_brake,
-        "risk_brake_text": risk_brake_text,
-        "volatility_edge": volatility_edge,
-        "volatility_edge_text": vol_edge_text,
-        "final_mult": final_mult,
-        "z_score": z,
-        "daily_ret": daily_ret,
+        "risk_brake": decision.risk_brake,
+        "risk_brake_text": decision.risk_brake_text,
+        "volatility_edge": decision.volatility_edge,
+        "volatility_edge_text": decision.volatility_edge_text,
+        "final_mult": decision.final_mult,
+        "raw_final_mult": decision.raw_final_mult,
+        "z_score": decision.z_score,
+        "daily_ret": decision.daily_ret,
+        "prev_close": vol_ctx["prev_close"],
         "atr14": vol_ctx["atr14"],
         "atr60": vol_ctx["atr60"],
-        "adaptive_window": vol_ctx["window"],
+        "adaptive_window": decision.adaptive_window,
+        "ma_adaptive": decision.ma_adaptive,
+        "atr_adaptive": decision.atr_adaptive,
+        "safety_vol": decision.safety_vol,
+        "safety_oi": decision.safety_oi,
+        "safety_funding": decision.safety_funding,
+        "safety_score": decision.safety_score,
         "sources": DATA_SOURCES.copy(),
     }
+
+
+
+# ---------------------------
+# Run logging
+# ---------------------------
+def append_run_log(result: dict, log_path: str = "logs/dca_runs.csv"):
+    """Append or update the daily run log for offline analysis.
+
+    Logging failures are swallowed to avoid breaking the main flow.
+    """
+    try:
+        snap: Snapshot = result.get("snapshot")
+        if snap is None:
+            raise ValueError("missing snapshot in result")
+
+        sources = result.get("sources", {})
+
+        now_utc = datetime.now(timezone.utc).replace(microsecond=0)
+        ts_utc = now_utc.isoformat().replace("+00:00", "Z")
+        ts_local = now_utc.astimezone(ZoneInfo("Asia/Tokyo")).isoformat()
+        decision_date = now_utc.date().isoformat()
+
+        columns = [
+            "ts_utc",
+            "ts_local",
+            "decision_date",
+            "data_source_klines",
+            "data_source_oi",
+            "data_source_funding",
+            "price_spot",
+            "price_mark",
+            "ma200d",
+            "ma200w",
+            "mayer",
+            "dist_200w",
+            "ssr_like",
+            "vol30d",
+            "funding",
+            "oi_notional",
+            "oi_trend_7d",
+            "price_trend_7d",
+            "atr14",
+            "atr60",
+            "adaptive_window",
+            "ma_adaptive",
+            "atr_adaptive",
+            "prev_close",
+            "z_score",
+            "valuation_score",
+            "liquidity_score",
+            "total_score",
+            "mult_raw",
+            "safety_vol",
+            "safety_oi",
+            "safety_funding",
+            "safety_score",
+            "risk_brake",
+            "volatility_edge",
+            "final_mult",
+            "base_invest",
+            "invest_amount",
+            "edge_triggered",
+            "brake_strength_level",
+            "price_30d_forward",
+            "price_300d_forward",
+            "pnl_30d",
+            "pnl_300d",
+        ]
+
+        risk_brake = result.get("risk_brake", float("nan"))
+        volatility_edge = result.get("volatility_edge", 0.0)
+
+        def _brake_level(brake: float) -> str:
+            if math.isnan(brake) or brake >= 0:
+                return "none"
+            if brake <= -0.4:
+                return "heavy"
+            if brake <= -0.2:
+                return "medium"
+            return "light"
+
+        record = {
+            "ts_utc": ts_utc,
+            "ts_local": ts_local,
+            "decision_date": decision_date,
+            "data_source_klines": sources.get("kline", ""),
+            "data_source_oi": sources.get("oi", ""),
+            "data_source_funding": sources.get("funding", ""),
+            "price_spot": snap.price,
+            "price_mark": snap.mark_price,
+            "ma200d": snap.ma200d,
+            "ma200w": snap.ma200w,
+            "mayer": snap.mayer,
+            "dist_200w": snap.dist200w,
+            "ssr_like": snap.ssr,
+            "vol30d": snap.vol30d,
+            "funding": snap.funding,
+            "oi_notional": snap.oi,
+            "oi_trend_7d": result.get("oi_trend", float("nan")),
+            "price_trend_7d": snap.trend7d,
+            "atr14": result.get("atr14", float("nan")),
+            "atr60": result.get("atr60", float("nan")),
+            "adaptive_window": result.get("adaptive_window", float("nan")),
+            "ma_adaptive": result.get("ma_adaptive", float("nan")),
+            "atr_adaptive": result.get("atr_adaptive", float("nan")),
+            "prev_close": result.get("prev_close", float("nan")),
+            "z_score": result.get("z_score", float("nan")),
+            "valuation_score": result.get("valuation_score", float("nan")),
+            "liquidity_score": result.get("liquidity_score", float("nan")),
+            "total_score": result.get("score", float("nan")),
+            "mult_raw": result.get("raw_final_mult", float("nan")),
+            "safety_vol": result.get("safety_vol", float("nan")),
+            "safety_oi": result.get("safety_oi", float("nan")),
+            "safety_funding": result.get("safety_funding", float("nan")),
+            "safety_score": result.get("safety_score", float("nan")),
+            "risk_brake": risk_brake,
+            "volatility_edge": volatility_edge,
+            "final_mult": result.get("final_mult", float("nan")),
+            "base_invest": result.get("base", float("nan")),
+            "invest_amount": result.get("invest", float("nan")),
+            "edge_triggered": bool(volatility_edge),
+            "brake_strength_level": _brake_level(risk_brake),
+            "price_30d_forward": "",
+            "price_300d_forward": "",
+            "pnl_30d": "",
+            "pnl_300d": "",
+        }
+
+        os.makedirs(os.path.dirname(log_path) or ".", exist_ok=True)
+
+        df_existing = pd.DataFrame(columns=columns)
+        if os.path.exists(log_path):
+            df_existing = pd.read_csv(log_path)
+            for col in columns:
+                if col not in df_existing.columns:
+                    df_existing[col] = np.nan
+            df_existing = df_existing[df_existing["decision_date"].astype(str) != decision_date]
+            df_existing = df_existing[columns]
+
+        df_new = pd.concat([
+            df_existing,
+            pd.DataFrame([record], columns=columns),
+        ], ignore_index=True)
+        df_new.to_csv(log_path, index=False)
+    except Exception as e:
+        print(f"⚠️ 写入运行日志失败：{e}")
 
 
 
@@ -1192,6 +1441,8 @@ def main():
     print("\n--- 本次运行实际数据源 ---")
     for k, v in DATA_SOURCES.items():
         if v: print(f"{k}: {v}")
+
+    append_run_log(result)
 
 
 
