@@ -353,10 +353,16 @@ def _get_funding_from_binance() -> float:
 
 
 def _get_funding_from_hyperliquid() -> float:
-    ctx = _get_hl_perp_ctx()
-    f = ctx.get("funding")
+    ticker = http_post_json(HL_INFO, {"type": "ticker", "coin": "BTC"})
+    if not ticker or not isinstance(ticker, dict):
+        raise RuntimeError("Hyperliquid ticker 返回异常")
+
+    f = ticker.get("fundingRate")
     if f is None:
-        raise RuntimeError("Hyperliquid funding 字段缺失")
+        f = ticker.get("funding")
+    if f is None:
+        raise RuntimeError("Hyperliquid ticker 缺少 funding 字段")
+
     return _normalize_hl_funding(float(f))
 
 
