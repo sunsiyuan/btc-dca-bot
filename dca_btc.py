@@ -353,31 +353,47 @@ def _get_funding_from_binance() -> float:
 
 
 def _get_funding_from_hyperliquid() -> float:
+    def _extract_funding(obj: dict):
+        for k in ("fundingRate", "funding"):
+            v = obj.get(k)
+            if v is not None:
+                try:
+                    return float(v)
+                except (TypeError, ValueError):
+                    continue
+        return None
+
     ticker = http_post_json(HL_INFO, {"type": "ticker", "coin": "BTC"})
-    if not ticker or not isinstance(ticker, dict):
-        raise RuntimeError("Hyperliquid ticker 返回异常")
+    if ticker and isinstance(ticker, dict):
+        f = _extract_funding(ticker)
+        if f is not None:
+            return _normalize_hl_funding(f, source="ticker")
 
-    f = ticker.get("fundingRate")
-    if f is None:
-        f = ticker.get("funding")
-    if f is None:
-        raise RuntimeError("Hyperliquid ticker 缺少 funding 字段")
+    # 回退：从资产上下文中读取 funding（metaAndAssetCtxs 中包含最新 funding 估计值）
+    ctx = _get_hl_perp_ctx()
+    if ctx and isinstance(ctx, dict):
+        f = _extract_funding(ctx)
+        if f is not None:
+            return _normalize_hl_funding(f, source="ctx")
 
-    return _normalize_hl_funding(float(f))
+    raise RuntimeError("Hyperliquid ticker / ctx 缺少 funding 字段")
 
 
-def _normalize_hl_funding(f_val: float) -> float:
-    """将 Hyperliquid 的“每秒资金费率”对齐为 8 小时费率的量级。
+def _normalize_hl_funding(f_val: float, source: str) -> float:
+    """将 Hyperliquid funding 对齐为“8 小时费率”的量级。
 
     其他所有使用 funding 的逻辑（风险打分 / 通知输出等）都假设是 8h 费率。
-    为避免出现 -0.00000 这样的近零展示或风险权重失真，这里统一处理。
+    - ticker 接口返回的是“每秒资金费率”，需要放大到 8 小时尺度；
+    - meta/asset ctx 内的 funding 一般已是窗口化后的值，不必强行缩放，
+      但若数值极小（看起来仍是每秒级）则继续按每秒→8h 处理。
     """
-    # Hyperliquid 返回的 funding 为“每秒资金费率”，数量级远小于 Binance 的 8 小时费率。
-    # 为了与 Binance 输出保持一致，做一个温和的单位对齐：
-    # - 如果原值非常接近 0（<1e-5），按“每秒 * 8 小时”的尺度放大；
-    # - 若未来官方直接返回 8h 费率或数值本身已正常，则保持原样避免过度放大。
-    if abs(f_val) < 1e-5:
-        f_val *= 8 * 60 * 60
+    eight_hours = 8 * 60 * 60
+    if source == "ticker":
+        return f_val * eight_hours
+
+    # ctx 通常已是 8h 量级；仅在数值明显仍为“每秒”时进行兜底放大。
+    if abs(f_val) < 1e-7:
+        return f_val * eight_hours
     return f_val
 
 
