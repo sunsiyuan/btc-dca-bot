@@ -353,17 +353,30 @@ def _get_funding_from_binance() -> float:
 
 
 def _get_funding_from_hyperliquid() -> float:
+    def _extract_funding(obj: dict):
+        for k in ("fundingRate", "funding"):
+            v = obj.get(k)
+            if v is not None:
+                try:
+                    return float(v)
+                except (TypeError, ValueError):
+                    continue
+        return None
+
     ticker = http_post_json(HL_INFO, {"type": "ticker", "coin": "BTC"})
-    if not ticker or not isinstance(ticker, dict):
-        raise RuntimeError("Hyperliquid ticker 返回异常")
+    if ticker and isinstance(ticker, dict):
+        f = _extract_funding(ticker)
+        if f is not None:
+            return _normalize_hl_funding(f)
 
-    f = ticker.get("fundingRate")
-    if f is None:
-        f = ticker.get("funding")
-    if f is None:
-        raise RuntimeError("Hyperliquid ticker 缺少 funding 字段")
+    # 回退：从资产上下文中读取 funding（metaAndAssetCtxs 中包含最新 funding 估计值）
+    ctx = _get_hl_perp_ctx()
+    if ctx and isinstance(ctx, dict):
+        f = _extract_funding(ctx)
+        if f is not None:
+            return _normalize_hl_funding(f)
 
-    return _normalize_hl_funding(float(f))
+    raise RuntimeError("Hyperliquid ticker / ctx 缺少 funding 字段")
 
 
 def _normalize_hl_funding(f_val: float) -> float:
