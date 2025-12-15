@@ -2,8 +2,8 @@ name: BTC DCA Notify Daily
 
 on:
   schedule:
-    # GitHub 用 UTC，北京 (UTC+8) 下午 2 点 = UTC 06:00
-    - cron: "0 6 * * *"
+    # GitHub 用 UTC，北京 (UTC+8) 上午 11:30 = UTC 03:30
+    - cron: "30 3 * * *"
   workflow_dispatch: {}  # 支持手动点执行
 
 permissions:
