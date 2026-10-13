@@ -2,7 +2,7 @@
 
 ## 模型概览（DTC / dca_btc.py）
 - **核心理念**：Dynamic DCA（DTC）模型由估值层、风险刹车层、机会层叠加，最终买入金额 = 基础金额 × `final_mult`，通过 `clamp(mult + risk_brake + volatility_edge)` 控制上下限。
-- **估值层 (`mult`)**：基于 Mayer Multiple、200 周均线距离、SSR 等慢变量给出阶梯倍数，不重复惩罚风险。【F:dca_btc.py†L4-L99】
+- **估值层 (`mult`)**：基于 Mayer Multiple、200 周均线距离、MVRV 三个慢变量给出阶梯倍数，不重复惩罚风险。【F:dca_btc.py†L4-L99】
 - **风险层 (`risk_brake`)**：只做刹车，依据 Funding、7 日 OI 趋势、30 日波动率生成安全分数，趋势向下时刹车减弱，趋势向上且杠杆累积时刹车全额生效。【F:dca_btc.py†L31-L55】
 - **机会层 (`volatility_edge`)**：自适应 ATR 窗口识别快速超跌，Z 分数越低加成越大，若当日反抽则取消加仓，避免追高。【F:dca_btc.py†L56-L79】
 - **设计哲学**：估值定仓、风险踩刹车、只在错杀日加仓，不做预测而是自适应结构。【F:dca_btc.py†L100-L107】
@@ -22,7 +22,7 @@
 ## 数据源选择与回退
 - K 线：默认 Binance，失败自动回退 OKX；也可通过 `DATA_SOURCE` 设为 OKX 主、Binance 备。【F:dca_btc.py†L242-L268】
 - 衍生品指标（Mark Price、Funding、OI）：默认 Hyperliquid，失败回退 Binance；可通过 `DERIV_SOURCE` 切换优先顺序。【F:dca_btc.py†L378-L439】【F:dca_btc.py†L442-L466】
-- SSR：固定从 CoinGecko 读取 BTC 市值与稳定币篮子市值计算比值，并记录数据源标识。【F:dca_btc.py†L688-L720】
+- MVRV：从 CoinMetrics 社区接口取昨天的 PriceUSD / CapMVRVCur 得到实现价格，再用今天现价算 MVRV；接口失败时沿用 `logs/dca_runs.csv` 里最近一次的实现价格，仍拿不到则按最低档计分（不会因缺数据多买）。2026-10 起取代原先的 SSR（SSR 的分档是固定数值，比值本身却随稳定币扩张逐年下行，回测里不如 MVRV）。
 - OI 历史缓存：每次运行都会把 Hyperliquid 的 OI 名义价值写入 `hl_oi_history.json` 作为 Binance 历史缺失时的备份；文件位于仓库根目录，与 `dca_btc.py` 同级，Workflow 会在变更后自动提交。【F:dca_btc.py†L492-L520】
 
 ## 通过 backtest 优化参数

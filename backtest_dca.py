@@ -33,7 +33,7 @@ def snapshot_from_log_row(row: Dict) -> Snapshot:
         mark_price=_as_float(row.get("price_mark", row.get("price_spot"))),
         mayer=_as_float(row.get("mayer")),
         dist200w=_as_float(row.get("dist_200w")),
-        ssr=_as_float(row.get("ssr_like")),
+        mvrv=_as_float(row.get("mvrv")),  # 2026-10 之前的行没有 mvrv，会按最低档 −1 计分
         vol30d=_as_float(row.get("vol30d")),
         funding=_as_float(row.get("funding")),
         oi=_as_float(row.get("oi_notional")),

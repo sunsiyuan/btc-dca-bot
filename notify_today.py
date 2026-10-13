@@ -12,7 +12,7 @@ TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 FT_SENDKEY = os.getenv("FT_SENDKEY")
 WEBHOOK_URLS = os.getenv("WEBHOOK_URLS", "")  # 可选：多渠道 HTTP webhook
-BASE_AMOUNT = float(os.getenv("BASE_DCA_USDT", "30"))  # 可以用 env 覆盖 base
+BASE_AMOUNT = float(os.getenv("BASE_DCA_USDT", "20"))  # 可以用 env 覆盖 base
 
 # ===== 微信推送（Server酱） =====
 def send_wechat_by_ft(content: str):
@@ -84,7 +84,7 @@ def build_message(result: dict) -> str:
         "",
         f"🔵 Mayer Multiple: {snap.mayer:.3f}",
         f"🟣 距 200W MA: {snap.dist200w*100:.2f}%",
-        f"🟢 SSR-like: {snap.ssr:.3f}",
+        f"🟢 MVRV: {snap.mvrv:.3f}（实现价格 {snap.realized_price:,.0f}）",
         f"🟠 30D 年化波动率: {snap.vol30d:.3f}",
         f"📉 过去 7 天涨跌幅: {snap.trend7d*100:.2f}%",
         f"🔺 Funding Rate: {snap.funding:.5f}",
@@ -107,7 +107,6 @@ def build_message(result: dict) -> str:
         # "📡 数据源说明（逻辑）:",
         # "• K线 / 价格：优先 Binance 现货 BTCUSDT，失败时回退 OKX。",
         # "• Mark Price / Funding / OI：Hyperliquid 优先，失败时回退 Binance 永续。",
-        # "• SSR-like：CoinGecko — BTC 市值 ÷ 稳定币篮子市值。",
         "",
         "📡 本次实际使用的数据源：",
     ]

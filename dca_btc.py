@@ -23,7 +23,8 @@ BTC Adaptive DCA Strategy — Model Overview (v3)
 
 - Mayer Multiple
 - 距离 200W MA
-- SSR（Stablecoin / valuation proxy）
+- MVRV（现价 / 全网实现价格，CoinMetrics）：<1 +2，<1.5 +1，<2.5 0，其余 −1；
+  取数失败时沿用日志里最近一次的实现价格，仍拿不到按 −1（缺数据永远不加仓）
 
 此层为离散阶梯式 multiplier，不包含任何风险变量，避免重复惩罚风险。
 
@@ -122,7 +123,7 @@ import json
 BINANCE_SPOT = "https://api.binance.com"
 BINANCE_FUT = "https://fapi.binance.com"
 OKX_SPOT = "https://www.okx.com"
-CG = "https://api.coingecko.com/api/v3"
+CM_METRICS = "https://community-api.coinmetrics.io/v4/timeseries/asset-metrics"
 HL_INFO = "https://api.hyperliquid.xyz/info"
 # 将缓存文件放在脚本同目录，避免因工作目录不同导致路径漂移
 OI_CACHE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "hl_oi_history.json")
@@ -145,7 +146,7 @@ DATA_SOURCES = {
     "funding": "",
     "oi": "",
     "oi_history": "",
-    "ssr": "",
+    "mvrv": "",
 }
 
 # ---------------------------
@@ -705,41 +706,37 @@ def funding_risk_from_funding(f: float) -> float:
 
 
 # ---------------------------
-# SSR-like
+# MVRV（现价 / 实现价格）
 # ---------------------------
-STABLES = [
-    "tether", "usd-coin", "dai", "first-digital-usd",
-    "frax", "ethena-usde", "usdd", "paypal-usd"
-]
+def _realized_price_from_log(log_path: str = "logs/dca_runs.csv") -> float:
+    """CoinMetrics 失败时的兜底：日志里最近一次的实现价格（它一天只变化千分之几）。"""
+    try:
+        df = pd.read_csv(log_path)
+        s = df["realized_price"].dropna() if "realized_price" in df.columns else pd.Series(dtype=float)
+        return float(s.iloc[-1]) if len(s) else float("nan")
+    except Exception:
+        return float("nan")
 
 
-def get_ssr_like() -> float:
-    btc = http_get(f"{CG}/coins/bitcoin", {
-        "localization": "false", "tickers": "false", "market_data": "true"
+def get_realized_price() -> float:
+    """
+    实现价格 = CoinMetrics PriceUSD / CapMVRVCur（社区免费接口，日频，最新一根是昨天）。
+    MVRV 再用今天的现价除以它算出来，这样不受 CoinMetrics 一天延迟的影响。
+    """
+    data = http_get(CM_METRICS, {
+        "assets": "btc", "metrics": "PriceUSD,CapMVRVCur",
+        "frequency": "1d", "page_size": 3, "paging_from": "end",
     })
-    if not btc:
-        return float("nan")
+    try:
+        row = [r for r in data["data"] if r.get("PriceUSD") and r.get("CapMVRVCur")][-1]
+        DATA_SOURCES["mvrv"] = "coinmetrics"
+        return float(row["PriceUSD"]) / float(row["CapMVRVCur"])
+    except Exception as e:
+        print(f"⚠️ CoinMetrics MVRV 获取失败，回退到日志: {e}")
 
-    btc_mcap = btc["market_data"]["market_cap"]["usd"]
-
-    ids = ",".join(STABLES)
-    st = http_get(f"{CG}/coins/markets", {
-        "vs_currency": "usd",
-        "ids": ids,
-        "order": "market_cap_desc",
-        "per_page": len(STABLES),
-        "page": 1,
-        "sparkline": "false",
-    })
-    DATA_SOURCES["ssr"] = "coingecko" 
-    if not st:
-        return float("nan")
-
-    stable_mcap = sum(x.get("market_cap", 0.0) for x in st)
-    if stable_mcap == 0:
-        return float("nan")
-
-    return float(btc_mcap / stable_mcap)
+    rp = _realized_price_from_log()
+    DATA_SOURCES["mvrv"] = "log_fallback" if not math.isnan(rp) else "unavailable"
+    return rp
 
 
 # ---------------------------
@@ -751,13 +748,14 @@ class Snapshot:
     mark_price: float
     mayer: float
     dist200w: float
-    ssr: float
+    mvrv: float
     vol30d: float
     funding: float  # 统一用 8 小时费率的量级（Hyperliquid 会在获取时归一化）
     oi: float
     trend7d: float  # 过去 7 天涨跌幅（相对值，例如 0.05=+5%）
     ma200d: float = float("nan")
     ma200w: float = float("nan")
+    realized_price: float = float("nan")
 
 
 @dataclass
@@ -796,7 +794,7 @@ class Decision:
     mult: float
     mult_text: str
     valuation_score: float
-    liquidity_score: float
+    mvrv_score: float
     total_score: float
     risk_brake: float
     volatility_edge: float
@@ -910,11 +908,12 @@ def score_valuation(mayer, dist):
     return score
 
 
-def score_liquidity(ssr):
-    if math.isnan(ssr): return 0
-    if ssr < 1.5: return 2
-    if ssr < 3.0: return 1
-    if ssr < 5.0: return 0
+def score_mvrv(mvrv):
+    # 缺数据按最低档：缺失不能成为多买的理由
+    if math.isnan(mvrv): return -1
+    if mvrv < 1.0: return 2
+    if mvrv < 1.5: return 1
+    if mvrv < 2.5: return 0
     return -1
 
 
@@ -1105,8 +1104,8 @@ def decide(snapshot: Snapshot, ctx: DecisionContext | None = None, cfg: Strategy
     ctx = ctx or DecisionContext()
 
     val = score_valuation(snapshot.mayer, snapshot.dist200w)
-    liq = score_liquidity(snapshot.ssr)
-    total = val + liq
+    mv = score_mvrv(snapshot.mvrv)
+    total = val + mv
 
     mult, txt = map_total_to_mult(total, cfg)
 
@@ -1129,7 +1128,7 @@ def decide(snapshot: Snapshot, ctx: DecisionContext | None = None, cfg: Strategy
         mult=mult,
         mult_text=txt,
         valuation_score=val,
-        liquidity_score=liq,
+        mvrv_score=mv,
         total_score=total,
         risk_brake=risk_brake,
         volatility_edge=volatility_edge,
@@ -1198,7 +1197,7 @@ def run_today(base: float = 30.0):
     mark_price = get_mark_price()
 
     ma200w, dist = get_200w_distance(price)
-    ssr = get_ssr_like()
+    realized_price = get_realized_price()
     vol = get_30d_vol()
     funding = get_funding()
     oi = get_open_interest()
@@ -1209,13 +1208,14 @@ def run_today(base: float = 30.0):
         mark_price=mark_price,
         mayer=mayer,
         dist200w=dist,
-        ssr=ssr,
+        mvrv=price / realized_price,
         vol30d=vol,
         funding=funding,
         oi=oi,
         trend7d=trend7d,
         ma200d=ma200d,
         ma200w=ma200w,
+        realized_price=realized_price,
     )
 
     # 先记录一份当日 HL OI 到本地缓存（如果 HL 可用）
@@ -1242,7 +1242,7 @@ def run_today(base: float = 30.0):
         "text": decision.mult_text,
         "score": decision.total_score,
         "valuation_score": decision.valuation_score,
-        "liquidity_score": decision.liquidity_score,
+        "mvrv_score": decision.mvrv_score,
         "oi_trend": oi_tr,
         "base": base,
         "invest": decision.invest,
@@ -1335,6 +1335,10 @@ def append_run_log(result: dict, log_path: str = "logs/dca_runs.csv"):
             "price_300d_forward",
             "pnl_30d",
             "pnl_300d",
+            "realized_price",
+            "mvrv",
+            "mvrv_score",
+            "data_source_mvrv",
         ]
 
         risk_brake = result.get("risk_brake", float("nan"))
@@ -1362,7 +1366,7 @@ def append_run_log(result: dict, log_path: str = "logs/dca_runs.csv"):
             "ma200w": snap.ma200w,
             "mayer": snap.mayer,
             "dist_200w": snap.dist200w,
-            "ssr_like": snap.ssr,
+            "ssr_like": float("nan"),  # 2026-10 起不再使用 SSR，保留列以免丢历史
             "vol30d": snap.vol30d,
             "funding": snap.funding,
             "oi_notional": snap.oi,
@@ -1376,7 +1380,7 @@ def append_run_log(result: dict, log_path: str = "logs/dca_runs.csv"):
             "prev_close": result.get("prev_close", float("nan")),
             "z_score": result.get("z_score", float("nan")),
             "valuation_score": result.get("valuation_score", float("nan")),
-            "liquidity_score": result.get("liquidity_score", float("nan")),
+            "liquidity_score": float("nan"),
             "total_score": result.get("score", float("nan")),
             "mult_raw": result.get("raw_final_mult", float("nan")),
             "safety_vol": result.get("safety_vol", float("nan")),
@@ -1394,6 +1398,10 @@ def append_run_log(result: dict, log_path: str = "logs/dca_runs.csv"):
             "price_300d_forward": "",
             "pnl_30d": "",
             "pnl_300d": "",
+            "realized_price": snap.realized_price,
+            "mvrv": snap.mvrv,
+            "mvrv_score": result.get("mvrv_score", float("nan")),
+            "data_source_mvrv": sources.get("mvrv", ""),
         }
 
         os.makedirs(os.path.dirname(log_path) or ".", exist_ok=True)
@@ -1440,7 +1448,7 @@ def main():
     print(f"过去 7 天涨跌幅: {snap.trend7d*100:.2f}%")   
     print(f"Mayer Multiple: {snap.mayer:.3f}")
     print(f"距200W: {snap.dist200w*100:.2f}%")
-    print(f"SSR-like: {snap.ssr:.3f}")
+    print(f"MVRV: {snap.mvrv:.3f}（实现价格 {snap.realized_price:,.0f}）")
     print(f"30D 年化波动率: {snap.vol30d:.3f}")
     print(f"Funding Rate: {snap.funding:.5f}")
     print(f"Open Interest 名义价值: {snap.oi:,.0f}")
@@ -1459,7 +1467,6 @@ def main():
     # print("\n--- 数据源说明 ---")
     # print("K线 / 价格：优先 Binance 现货 BTCUSDT，失败时回退 OKX 现货 BTC-USDT。")
     # print("Mark Price / Funding / OI（杠杆、情绪）：优先 Hyperliquid BTC 永续，失败时回退 Binance U 本位永续 BTCUSDT。")
-    # print("SSR-like：CoinGecko 上 BTC 市值 ÷ 稳定币篮子（USDT / USDC / DAI / FDUSD / FRAX / USDe / USDD / PYUSD）。")
     print("\n--- 本次运行实际数据源 ---")
     for k, v in DATA_SOURCES.items():
         if v: print(f"{k}: {v}")
