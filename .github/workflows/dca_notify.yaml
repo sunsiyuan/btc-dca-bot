@@ -33,7 +33,7 @@ jobs:
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           FT_SENDKEY: ${{ secrets.FT_SENDKEY }}
           WEBHOOK_URLS: ${{ secrets.WEBHOOK_URLS }}   # 可选
-          BASE_DCA_USDT: "30"                         # 可以在这里改基础定投金额
+          BASE_DCA_USDT: "20"                         # 可以在这里改基础定投金额
         working-directory: ${{ github.workspace }}     # 确保读取/写入 hl_oi_history.json 的相对路径是仓库根目录
         run: |
           python notify_today.py
